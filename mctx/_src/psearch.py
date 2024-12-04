@@ -28,7 +28,7 @@ Tree = tree_lib.Tree
 T = TypeVar("T")
 
 
-def search(
+def p_search(
     params: base.Params,
     rng_key: chex.PRNGKey,
     *,
@@ -97,7 +97,6 @@ def search(
     next_node_index = tree.children_index[batch_range, parent_index, action]
     next_node_index = jnp.where(next_node_index == Tree.UNVISITED,
                                 sim + 1, next_node_index)
-  
     tree = expand(
         params, expand_key, tree, recurrent_fn, parent_index,
         action, next_node_index)
@@ -155,7 +154,7 @@ def simulate(
     node_index = state.next_node_index
     rng_key, action_selection_key = jax.random.split(state.rng_key)
     action = action_selection_fn(action_selection_key, tree, node_index,
-                                 state.depth)
+                                 state.depth) # Action Selection
     next_node_index = tree.children_index[node_index, action]
     # The returned action will be visited.
     depth = state.depth + 1
@@ -224,10 +223,7 @@ def expand(
       lambda x: x[batch_range, parent_index], tree.embeddings)
 
   # Evaluate and create a new node.
-  rng_keys = jax.random.split(rng_key, batch_size)
-  # step, embedding = jax.vmap(recurrent_fn, (None, 0, None, None), out_axes=0)(
-  #     params, rng_keys, action, embedding)
-  step, embedding = recurrent_fn(params, rng_keys, action, embedding)
+  step, embedding = recurrent_fn(params, rng_key, action, embedding)
   chex.assert_shape(step.prior_logits, [batch_size, tree.num_actions])
   chex.assert_shape(step.reward, [batch_size])
   chex.assert_shape(step.discount, [batch_size])
@@ -354,8 +350,6 @@ def instantiate_tree_from_root(
   """Initializes tree state at search root."""
   chex.assert_rank(root.prior_logits, 2)
   batch_size, num_actions = root.prior_logits.shape
-  print("batch_size: ", batch_size)
-  print("value shape: ", root.value.shape)
   chex.assert_shape(root.value, [batch_size])
   num_nodes = num_simulations + 1
   data_dtype = root.value.dtype

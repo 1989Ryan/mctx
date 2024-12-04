@@ -45,6 +45,244 @@ def switching_action_selection_wrapper(
   return switching_action_selection_fn
 
 
+def paralleled_pikl_uct_action_samples(
+    rng_key: chex.PRNGKey,
+    tree: tree_lib.Tree,
+    node_index: chex.Numeric,
+    depth: chex.Numeric,
+    *,
+    pb_c_init: float = 1.25,
+    pb_c_base: float = 19652.0,
+    qtransform: base.QTransform = qtransforms.qtransform_by_parent_and_siblings,
+) -> chex.Array:
+  """Returns the action selected for a node index.
+
+  See Appendix B in https://arxiv.org/pdf/1911.08265.pdf for more details.
+
+  Args:
+    rng_key: random number generator state.
+    tree: _unbatched_ MCTS tree state.
+    node_index: scalar index of the node from which to select an action.
+    depth: the scalar depth of the current node. The root has depth zero.
+    pb_c_init: constant c_1 in the PUCT formula.
+    pb_c_base: constant c_2 in the PUCT formula.
+    qtransform: a monotonic transformation to convert the Q-values to [0, 1].
+
+  Returns:
+    action: the action selected from the given node.
+  """
+  visit_counts = tree.children_visits[node_index]
+  node_visit = tree.node_visits[node_index]
+  pb_c = pb_c_init + jnp.log((node_visit + pb_c_base + 1.) / pb_c_base)
+  prior_logits = tree.children_prior_logits[node_index]
+  prior_probs = jax.nn.softmax(prior_logits)
+  policy_score = jnp.sqrt(node_visit) * pb_c * prior_probs / (visit_counts + 1)
+  chex.assert_shape([node_index, node_visit], ())
+  chex.assert_equal_shape([prior_probs, visit_counts, policy_score])
+  value_score = qtransform(tree, node_index)
+  def pi_bar():
+    lambda_N = pb_c * jnp.sqrt((jnp.log(node_visit + 1)) / (visit_counts + 1e-4))
+    alpha_min = jnp.max(value_score + lambda_N * 1 / jnp.sqrt(len(visit_counts)))
+    alpha_max = jnp.max(value_score + lambda_N)
+    def cond_fn(val):
+      mid = (val[0] + val[1]) / 2
+      return jnp.logical_and(jnp.abs(jnp.sum(lambda_N**2 / (len(value_score) * (mid - value_score)**2)) - 1) > 1e-4,
+                  alpha[1] - alpha[0] > 1e-4)
+
+    def body_fn(val):
+      mid = (val[0] + val[1]) / 2
+      return jnp.where(jnp.sum(lambda_N**2 / (len(value_score) * (mid - value_score)**2)) > 1, (mid, alpha[1]), (alpha[0], mid))
+    
+    init_val = jnp.array([alpha_min, alpha_max])
+    
+    alpha = jax.lax.while_loop(cond_fn, body_fn, init_val)
+    choices_weigths = jax.lax.cond(
+        jnp.abs(alpha_min - alpha_max) < 1e-4,
+        lambda x: jnp.ones_like(x) / len(x),
+        lambda x: lambda_N ** 2 / (len(x) * (alpha[0] - x)**2),
+        value_score)
+    return choices_weigths 
+
+  # Masking the invalid actions at the root.
+  return masked_sample(rng_key, pi_bar(), tree.root_invalid_actions * (depth == 0))
+
+
+
+def uct_action_selection(
+    rng_key: chex.PRNGKey,
+    tree: tree_lib.Tree,
+    node_index: chex.Numeric,
+    depth: chex.Numeric,
+    *,
+    c_param: float = 1.414,
+    qtransform: base.QTransform = qtransforms.qtransform_by_parent_and_siblings,
+) -> chex.Array:
+  """Returns the action selected for a node index.
+
+  Args:
+    rng_key: random number generator state.
+    tree: _unbatched_ MCTS tree state.
+    node_index: scalar index of the node from which to select an action.
+    depth: the scalar depth of the current node. The root has depth zero.
+    pb_c_init: constant c_1 in the PUCT formula.
+    pb_c_base: constant c_2 in the PUCT formula.
+    qtransform: a monotonic transformation to convert the Q-values to [0, 1].
+
+  Returns:
+    action: the action selected from the given node.
+  """
+  visit_counts = tree.children_visits[node_index]
+  node_visit = tree.node_visits[node_index]
+  # pb_c = pb_c_init + jnp.log((node_visit + pb_c_base + 1.) / pb_c_base)
+  
+  # UCT action selection
+  policy_score = c_param * jnp.sqrt(jnp.log(node_visit + 1) / (visit_counts + 1e-4))
+  chex.assert_shape([node_index, node_visit], ())
+  chex.assert_equal_shape([visit_counts, policy_score])
+  value_score = qtransform(tree, node_index)
+
+  # Add tiny bit of randomness for tie break
+  node_noise_score = 1e-7 * jax.random.uniform(
+      rng_key, (tree.num_actions,))
+  to_argmax = value_score + policy_score + node_noise_score
+
+  # Masking the invalid actions at the root.
+  return masked_argmax(to_argmax, tree.root_invalid_actions * (depth == 0))
+
+
+@jax.jit
+def compute_pikl_weights(q, visits, num_children, c_param, uniform=None):
+    lambda_N = c_param * jnp.sqrt(jnp.log(visits) / (visits + num_children)) 
+
+    alpha_min = jnp.max(q + lambda_N )
+    alpha_max = jnp.max(q + lambda_N *jnp.sqrt(num_children) )    
+    # print(alpha_min, alpha_max)
+    # print(jnp.sum(lambda_N**2 / ((alpha_min - q)**2)))
+    # print(jnp.sum(lambda_N**2 / ((alpha_max - q)**2)))
+    def cond_fn(val):
+        alpha = val
+        mid = (alpha[0] + alpha[1]) / 2
+        return jnp.logical_and(jnp.abs(jnp.sum(lambda_N**2 / ((mid - q)**2)) - 1) > 1e-3,
+        # return jnp.logical_and(jnp.abs(jnp.sum(lambda_N**2 / (num_children * (mid - q)**2)) - 1) > 1e-3,
+                            alpha[1] - alpha[0] > 1e-3)
+    def body_fn(val):
+        alpha = val
+        mid = (alpha[0] + alpha[1]) / 2
+        # alpha = jax.lax.cond(jnp.sum(lambda_N**2 / (num_children * (mid - q)**2)) > 1,
+        alpha = jax.lax.cond(jnp.sum(lambda_N**2 / ((mid - q)**2)) > 1,
+                            lambda _: jnp.array([(alpha[0] + alpha[1]) / 2, alpha[1]]),
+                            lambda _: jnp.array([alpha[0], (alpha[0] + alpha[1]) / 2]),
+                            operand=alpha) 
+        return alpha
+    init_val = jnp.array([alpha_min, alpha_max])
+
+    alpha = jax.lax.cond(jnp.abs(alpha_max - alpha_min) < 1e-3,
+                lambda _: alpha_min / 2 + alpha_max / 2,
+                lambda _: jnp.sum(jax.lax.while_loop(cond_fn, body_fn, init_val)) / 2,
+                operand=None)
+
+    choices_weights = jax.lax.cond(visits <= 1,
+                lambda _: uniform,
+                # lambda _: lambda_N**2 / (num_children * (alpha - q)**2),
+                lambda _: lambda_N**2 / ((alpha - q)**2),
+                operand=None)
+    return choices_weights
+
+
+def delta_pikl_action_selection(
+    rng_key: chex.PRNGKey,
+    tree: tree_lib.Tree,
+    node_index: chex.Numeric,
+    depth: chex.Numeric,
+    *,
+    c_param: float = 1.414,
+    qtransform: base.QTransform = qtransforms.qtransform_by_parent_and_siblings,
+) -> chex.Array:
+  """Returns the action selected for a node index.
+
+  Args:
+    rng_key: random number generator state.
+    tree: _unbatched_ MCTS tree state.
+    node_index: scalar index of the node from which to select an action.
+    depth: the scalar depth of the current node. The root has depth zero.
+    pb_c_init: constant c_1 in the PUCT formula.
+    pb_c_base: constant c_2 in the PUCT formula.
+    qtransform: a monotonic transformation to convert the Q-values to [0, 1].
+
+  Returns:
+    action: the action selected from the given node.
+  """
+  visit_counts = tree.children_visits[node_index]
+  node_visit = tree.node_visits[node_index]
+  # pb_c = pb_c_init + jnp.log((node_visit + pb_c_base + 1.) / pb_c_base)
+  # UCT action selection
+  # policy_score = c_param * jnp.sqrt(jnp.log(node_visit + 1) / (visit_counts + 1e-4))
+  policy_weights = compute_pikl_weights(qtransform(tree, node_index), 
+            node_visit, tree.num_actions, c_param, jnp.ones_like(visit_counts) / len(visit_counts))
+  
+  # chex.assert_shape([node_index, node_visit], ())
+  # chex.assert_equal_shape([visit_counts, policy_score])
+  # value_score = qtransform(tree, node_index)
+
+  # # Add tiny bit of randomness for tie break
+  # # node_noise_score = 1e-7 * jax.random.uniform(
+  # #     rng_key, (tree.num_actions,))
+  # to_argmax = value_score + policy_score
+  #   #+ node_noise_score
+
+  # # Masking the invalid actions at the root.
+  # return masked_argmax(to_argmax, tree.root_invalid_actions * (depth == 0))
+  return masked_sample(rng_key, policy_weights, tree.root_invalid_actions * (depth == 0))
+
+
+
+
+def pikl_action_selection(
+    rng_key: chex.PRNGKey,
+    tree: tree_lib.Tree,
+    node_index: chex.Numeric,
+    depth: chex.Numeric,
+    *,
+    c_param: float = 1.414,
+    qtransform: base.QTransform = qtransforms.qtransform_by_parent_and_siblings,
+) -> chex.Array:
+  """Returns the action selected for a node index.
+
+  Args:
+    rng_key: random number generator state.
+    tree: _unbatched_ MCTS tree state.
+    node_index: scalar index of the node from which to select an action.
+    depth: the scalar depth of the current node. The root has depth zero.
+    pb_c_init: constant c_1 in the PUCT formula.
+    pb_c_base: constant c_2 in the PUCT formula.
+    qtransform: a monotonic transformation to convert the Q-values to [0, 1].
+
+  Returns:
+    action: the action selected from the given node.
+  """
+  visit_counts = tree.children_visits[node_index]
+  node_visit = tree.node_visits[node_index]
+  # pb_c = pb_c_init + jnp.log((node_visit + pb_c_base + 1.) / pb_c_base)
+  # UCT action selection
+  # policy_score = c_param * jnp.sqrt(jnp.log(node_visit + 1) / (visit_counts + 1e-4))
+  policy_weights = compute_pikl_weights(qtransform(tree, node_index), 
+            node_visit, tree.num_actions, c_param, jnp.ones_like(visit_counts) / len(visit_counts))
+
+  # chex.assert_shape([node_index, node_visit], ())
+  # chex.assert_equal_shape([visit_counts, policy_score])
+  # value_score = qtransform(tree, node_index)
+
+  # # Add tiny bit of randomness for tie break
+  # # node_noise_score = 1e-7 * jax.random.uniform(
+  # #     rng_key, (tree.num_actions,))
+  # to_argmax = value_score + policy_score
+  #   #+ node_noise_score
+
+  # # Masking the invalid actions at the root.
+  # return masked_argmax(to_argmax, tree.root_invalid_actions * (depth == 0))
+  return masked_sample(rng_key, policy_weights, tree.root_invalid_actions * (depth == 0))
+
+
 def muzero_action_selection(
     rng_key: chex.PRNGKey,
     tree: tree_lib.Tree,
@@ -206,6 +444,19 @@ def masked_argmax(
     to_argmax = jnp.where(invalid_actions, -jnp.inf, to_argmax)
   # If all actions are invalid, the argmax returns action 0.
   return jnp.argmax(to_argmax, axis=-1).astype(jnp.int32)
+
+def masked_sample(
+    prng_key: chex.PRNGKey,
+    to_sample: chex.Array,
+    invalid_actions: Optional[chex.Array]) -> chex.Array:
+  """Returns a valid action with the highest `to_argmax`."""
+  if invalid_actions is not None:
+    chex.assert_equal_shape([to_sample, invalid_actions])
+    # The usage of the -inf inside the argmax does not lead to NaN.
+    # Do not use -inf inside softmax, logsoftmax or cross-entropy.
+    to_sample = jnp.where(invalid_actions, -jnp.inf, to_sample)
+  # If all actions are invalid, the argmax returns action 0.
+  return jax.random.categorical(prng_key, to_sample, 1).astype(jnp.int32)
 
 
 def _prepare_argmax_input(probs, visit_counts):

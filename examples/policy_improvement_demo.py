@@ -27,9 +27,9 @@ import mctx
 FLAGS = flags.FLAGS
 flags.DEFINE_integer("seed", 42, "Random seed.")
 flags.DEFINE_integer("batch_size", 256, "Batch size.")
-flags.DEFINE_integer("num_actions", 82, "Number of actions.")
-flags.DEFINE_integer("num_simulations", 4, "Number of simulations.")
-flags.DEFINE_integer("max_num_considered_actions", 16,
+flags.DEFINE_integer("num_actions", 10, "Number of actions.")
+flags.DEFINE_integer("num_simulations", 5, "Number of simulations.")
+flags.DEFINE_integer("max_num_considered_actions", 10,
                      "The maximum number of actions expanded at the root.")
 flags.DEFINE_integer("num_runs", 1, "Number of runs on random data.")
 
@@ -70,13 +70,15 @@ def _run_demo(rng_key: chex.PRNGKey) -> Tuple[chex.PRNGKey, DemoOutput]:
   recurrent_fn = _make_bandit_recurrent_fn(qvalues)
 
   # Running the search.
-  policy_output = mctx.gumbel_muzero_policy(
+  policy_output = mctx.uct_policy(
+  # policy_output = mctx.gumbel_muzero_policy(
       params=(),
       rng_key=search_rng,
       root=root,
       recurrent_fn=recurrent_fn,
       num_simulations=FLAGS.num_simulations,
-      max_num_considered_actions=FLAGS.max_num_considered_actions,
+      c_param = 1.0,
+      # max_num_considered_actions=FLAGS.max_num_considered_actions,
       qtransform=functools.partial(
           mctx.qtransform_completed_by_mix_value,
           use_mixed_value=use_mixed_value),
@@ -87,8 +89,8 @@ def _run_demo(rng_key: chex.PRNGKey) -> Tuple[chex.PRNGKey, DemoOutput]:
 
   # We will compare the selected action to the action selected by the
   # prior policy, while using the same Gumbel random numbers.
-  gumbel = policy_output.search_tree.extra_data.root_gumbel
-  prior_policy_action = jnp.argmax(gumbel + prior_logits, axis=-1)
+  # gumbel = policy_output.search_tree.extra_data.root_gumbel
+  prior_policy_action = jnp.argmax(prior_logits, axis=-1)
   prior_policy_action_value = qvalues[jnp.arange(batch_size),
                                       prior_policy_action]
 
