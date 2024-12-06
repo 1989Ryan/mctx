@@ -155,36 +155,46 @@ def parallel_pimct_search(
     invalid_actions = jnp.zeros_like(root.prior_logits)
 
   def body_fun(sim, loop_state):
-    jax.debug.print("sim {sim}", sim=sim)
+    jax.debug.print("sim {sim} / {total}", sim=sim, total=num_simulations)
     rng_key, tree, last_node_index = loop_state
     rng_key, simulate_key, expand_key = jax.random.split(rng_key, 3)
     # simulate is vmapped and expects batched rng keys.
     simulate_keys = jax.random.split(simulate_key, batch_size)
+    # jax.debug.print("simulate running")
     parent_index, action = parallel_sampling_simulate(
         simulate_keys, tree, num_choices, action_selection_fn, max_depth)
-
+    # jax.debug.print("simulate done")
+    # A node first expanded on simulation `i`, will have node index `i`.
     # assign unique next node index 
-    next_node_index, last_node_index = assign_unique_indices(tree, batch_range, parent_index, action, last_node_index)
 
+    next_node_index, last_node_index = assign_unique_indices(tree, batch_range, parent_index, action, last_node_index)
+    # jax.debug.print("expand running")
     tree = parallel_expand(
         params, expand_key, tree, recurrent_fn, parent_index,
         action, next_node_index, num_choices)
+    # jax.debug.print("expand done")
     def loop_backward(index, inputs):
       tree, next_node_index_ = inputs
-      jax.debug.print("backward {index}", index=index) 
+      # jax.debug.print("backward {index}", index=index) 
       next_node_index = next_node_index_.at[:, index].get()
-      jax.debug.print("next_node_index shape {next_node_index_}", next_node_index_=next_node_index.shape)
+      # jax.debug.print("next_node_index shape {next_node_index_}", next_node_index_=next_node_index.shape)
       tree = pimct_backward(tree, next_node_index, c_param, qtransform)
-      jax.debug.print("tree shape {tree}", tree=tree.children_index.shape)
+      # jax.debug.print("tree shape {tree}", tree=tree.children_index.shape)
       return tree, next_node_index_
-    jax.debug.print("Running backward")
+    # jax.debug.print("backward running")
     tree, _ = jax.lax.fori_loop(0, num_choices, loop_backward, (tree, next_node_index))
+    # jax.debug.print("backward done")
     # tree = pimct_backward_parallel(tree, next_node_index, c_param, qtransform)
+    # jax.debug.print("rng_key {rng_key}", rng_key=rng_key)
+    # jax.debug.print("tree shape {tree}", tree=tree.children_index.shape)
+    # jax.debug.print("last_node_index {last_node_index}", last_node_index=next_node_index)
     loop_state = rng_key, tree, last_node_index
+    # jax.debug.print("return loop state")
+    # jax.debug.print("Num simulations in total {sim}", sim=num_simulations)
     return loop_state
 
   # Allocate all necessary storage.
-  tree = instantiate_tree_from_root(root, num_simulations,
+  tree = instantiate_tree_from_root(root, num_simulations * num_choices,
                                     root_invalid_actions=invalid_actions,
                                     extra_data=extra_data)
   _, tree, _ = loop_fn(
@@ -431,6 +441,7 @@ def search(
     invalid_actions = jnp.zeros_like(root.prior_logits)
 
   def body_fun(sim, loop_state):
+    jax.debug.print("sim {sim} / {total}", sim=sim, total=num_simulations)
     rng_key, tree = loop_state
     rng_key, simulate_key, expand_key = jax.random.split(rng_key, 3)
     # simulate is vmapped and expects batched rng keys.
@@ -447,6 +458,7 @@ def search(
         params, expand_key, tree, recurrent_fn, parent_index,
         action, next_node_index)
     tree = backward(tree, next_node_index)
+    # jax.debug.print("next node index {next_node_index}", next_node_index=next_node_index)
     loop_state = rng_key, tree
     return loop_state
 
@@ -470,7 +482,7 @@ class _SimulationState(NamedTuple):
   is_continuing: bool
 
 
-@functools.partial(jax.vmap, in_axes=[0, 0, None, None, None], out_axes=0)
+@functools.partial(jax.vmap, in_axes=[0, 0, None, None, None,], out_axes=0)
 def parallel_sampling_simulate(
     rng_key: chex.PRNGKey,
     tree: Tree,
@@ -499,14 +511,19 @@ def parallel_sampling_simulate(
 
   def body_fun(state):
     # Preparing the next simulation state.
-    node_index = state.next_node_index
+    node_index = jnp.where(
+        state.is_continuing, state.next_node_index, state.node_index
+    )
+    # node_index = state.next_node_index
+    # jax.debug.print("node_index {node_index}", node_index=node_index)
     rng_key, action_selection_key = jnp.hsplit(jax.vmap(jax.random.split)(state.rng_key), 2)
     rng_key, action_selection_key = jnp.squeeze(rng_key, axis=1), jnp.squeeze(action_selection_key, axis=1)
     # rng_key, action_selection_key = jax.vmap(jax.random.split)(state.rng_key)
     # rng_key, action_selection_key = jax.random.split(state.rng_key)
     action = action_selection_fn(action_selection_key, tree, node_index,
-                                 state.depth)
+                                 depth=state.depth)
     next_node_index = tree.children_index[node_index, action]
+
     # The returned action will be visited.
     depth = state.depth + 1
     is_before_depth_cutoff = depth < max_depth
@@ -542,7 +559,7 @@ def parallel_sampling_simulate(
   
   # pytype: enable=wrong-arg-types
   end_state = jax.lax.while_loop(cond_fun, body_fun, initial_state)
-
+  # jax.debug.print("end_state {end_state}", end_state=end_state.node_index)
   # Returning a node with a selected action.
   # The action can be already visited, if the max_depth is reached.
   return end_state.node_index, end_state.action
@@ -633,6 +650,7 @@ def parallel_segment_counting(value, node_index, num_nodes):
       jnp.ones_like(value), node_index, num_nodes)
   return index_nums
 
+# @functools.partial(jax.jit, static_argnames=["recurrent_fn"])
 def parallel_expand(
     params: chex.Array,
     rng_key: chex.PRNGKey,
@@ -663,10 +681,11 @@ def parallel_expand(
   """
   batch_size = tree_lib.infer_batch_size(tree)
   batch_range = jnp.arange(batch_size)
-  chex.assert_shape([parent_index, action, next_node_index], (batch_size, num_choices))
+  # chex.assert_shape([parent_index, action, next_node_index], (batch_size, num_choices))
   # Retrieve states for nodes to be evaluated.
   # embedding = jax.tree.map(
   #     lambda x: x[batch_range, parent_index], tree.embeddings)
+  # jax.debug.print("end states {end_state}", end_state=tree.embeddings.end_state)
   func = functools.partial(
     jax.vmap(lambda y, x: x[batch_range, y], 
              in_axes=(1, None), out_axes=1), parent_index)
@@ -677,12 +696,13 @@ def parallel_expand(
   rng_keys = jax.random.split(rng_key, batch_size)
   # split rng_keys to [B, K, 1]
   rng_keys = jax.vmap(jax.random.split, in_axes=(0, None), out_axes=0)(rng_keys, num_choices)
+  # jax.debug.print("end states {end_state}", end_state=embedding.end_state)
   step, embedding = jax.vmap(recurrent_fn, (None, 1, 1, 1), out_axes=1)(
       params, rng_keys, action, embedding)
-  chex.assert_shape(step.prior_logits, [batch_size, num_choices, tree.num_actions])
-  chex.assert_shape(step.reward, [batch_size, num_choices])
-  chex.assert_shape(step.discount, [batch_size, num_choices])
-  chex.assert_shape(step.value, [batch_size, num_choices])
+  # chex.assert_shape(step.prior_logits, [batch_size, num_choices, tree.num_actions])
+  # chex.assert_shape(step.reward, [batch_size, num_choices])
+  # chex.assert_shape(step.discount, [batch_size, num_choices])
+  # chex.assert_shape(step.value, [batch_size, num_choices])
   
   # step_values = jax.vmap(jax.ops.segment_sum, in_axes=(0, 0, None), out_axes=0)(
   #     step.value, next_node_index, tree.node_values.shape[1])
@@ -695,6 +715,7 @@ def parallel_expand(
     tree = update_tree_node(tree, next_node_index.at[:, index].get(), 
                             step.prior_logits.at[:, index].get(), step_values.at[:, index].get(), 
                             jax.tree.map(lambda x: x.at[:, index].get(), embedding))
+    # jax.debug.print("info {index}", index=embedding.end_state)
     return tree, step_values, next_node_index
 
   tree, _, _ = jax.lax.fori_loop(0, num_choices, loop_body, (tree, step_values, next_node_index))
@@ -720,7 +741,7 @@ def parallel_expand(
     return tree, next_node_index_, parent_index_, action_, step_
 
   tree, _, _, _, _ = jax.lax.fori_loop(0, num_choices, loop_replace, (tree, next_node_index, parent_index, action, step))
-  jax.debug.print("expanded tree") 
+  # jax.debug.print("expanded tree") 
   return tree
   # tree = tree.replace(
   #     children_index=batch_update(
@@ -891,8 +912,8 @@ def pimct_backward_parallel(
         children_visits=update(
             tree.children_visits, child_count, parent, action))
 
-    # children_values = tree.children_values[parent]
-    children_values = qtransform(tree, parent, min_value=0, max_value=1)
+    children_values = tree.children_values[parent]
+    # children_values = qtransform(tree, parent, min_value=0, max_value=1)
     policy_weights = action_selection.compute_pikl_weights(
       children_values, count, tree.num_actions, c_param, jnp.ones_like(children_values) / tree.num_actions)
 
@@ -913,7 +934,7 @@ def pimct_backward_parallel(
   leaf_index = jnp.asarray(leaf_index, dtype=jnp.int32)
   loop_state = (tree, tree.node_values[leaf_index], leaf_index)
   tree, _, _ = jax.lax.while_loop(cond_fun, body_fun, loop_state)
-  jax.debug.print("pimct_backward_parallel completed")
+  # jax.debug.print("pimct_backward_parallel completed")
   return tree
 
 
@@ -1136,8 +1157,8 @@ def instantiate_tree_from_root(
   """Initializes tree state at search root."""
   chex.assert_rank(root.prior_logits, 2)
   batch_size, num_actions = root.prior_logits.shape
-  print("batch_size: ", batch_size)
-  print("value shape: ", root.value.shape)
+  # print("batch_size: ", batch_size)
+  # print("value shape: ", root.value.shape)
   chex.assert_shape(root.value, [batch_size])
   num_nodes = num_simulations + 1
   data_dtype = root.value.dtype

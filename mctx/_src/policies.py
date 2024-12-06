@@ -223,7 +223,7 @@ def parallel_pimct_policy(
       loop_fn=loop_fn,
       num_choices=num_samples,
       qtransform=qtransform)
-
+  jax.debug.print("search done")
   # Sampling the proposed action proportionally to the visit counts.
   summary = search_tree.summary()
   # action_weights = summary.visit_probs
@@ -236,7 +236,7 @@ def parallel_pimct_policy(
   # print(num_actions_batched.shape)
   
   action_weights = jax.vmap(action_selection.compute_pikl_weights)(qvalues, 
-                      num_visits, jnp.ones_like(num_visits) * search_tree.num_actions, 
+                      num_visits / num_samples, jnp.ones_like(num_visits) * search_tree.num_actions, 
                       jnp.ones_like(num_visits) * c_param, jnp.ones_like(summary.visit_counts) / search_tree.num_actions)
   # action_weights = summary.visit_probs
   # action_weights = action_selection.compute_pikl_weights(qvalues, 
@@ -316,7 +316,8 @@ def pimct_policy(
 
   # Running the search.
   interior_action_selection_fn = functools.partial(
-      action_selection.delta_pikl_action_selection,
+      action_selection.uct_action_selection,
+      # action_selection.delta_pikl_action_selection,
       c_param=c_param,
       qtransform=qtransform)
   root_action_selection_fn = functools.partial(

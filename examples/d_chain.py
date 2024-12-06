@@ -55,8 +55,9 @@ def env_step(env: Env, action: chex.Array) -> tuple[Env, chex.Array, chex.Array]
 
 
     # calculate done if the next state is in the end state
-    
-    done = jnp.any(jnp.all(next_state == env.end_state, axis=1))
+    # jax.debug.print("{info}", info=env.end_state)
+    # jax.debug.print("{info}", info=jnp.all(next_state == env.end_state, axis=-1))
+    done = jnp.any(jnp.all(next_state == env.end_state, axis=-1))
 
     # calculate depth
     # return the next state, depth, done, reward
@@ -71,7 +72,7 @@ def env_step(env: Env, action: chex.Array) -> tuple[Env, chex.Array, chex.Array]
         uniform_logits=env.uniform_logits)
     return new_env, reward, done
 
-# @jax.jit
+@jax.jit
 def rollout(env: Env, rng_key: chex.PRNGKey) -> chex.Array:
     def cond(inputs):
         env, key = inputs
@@ -82,7 +83,9 @@ def rollout(env: Env, rng_key: chex.PRNGKey) -> chex.Array:
         key, subkey = jax.random.split(key)
         action = jax.random.categorical(subkey, logits=env.uniform_logits)
         env, reward, done = env_step(env, action)
+        # jax.debug.print("{info}", info=env.state)
         return env, key
+    
     leaf, key = jax.lax.while_loop(cond, step, (env, rng_key))
     return leaf.reward
 
@@ -109,12 +112,14 @@ def recurrent_fn(params, rng_key, action, embedding):
     )
     return recurrent_fn_output, env
 
-# @functools.partial(jax.jit, static_argnums=(2,))
+available_devices = jax.devices()
+@functools.partial(jax.jit, static_argnums=(2,), device=available_devices[1])
 def run_mcts(rng_key: chex.PRNGKey, env: Env, num_simulations: int) -> chex.Array:
-    batch_size = 1
+    batch_size = 16
     jax.debug.print("{info}", info=env.depth)
     key1, key2 = jax.random.split(rng_key)
-    policy_output = mctx.parallel_pimct_policy(
+    policy_output = mctx.muzero_policy(
+    # policy_output = mctx.parallel_pimct_policy(
         params=None,
         rng_key=key1,
         root=jax.vmap(root_fn, (None, 0), 0)(env, jax.random.split(key2, batch_size)),
@@ -123,19 +128,19 @@ def run_mcts(rng_key: chex.PRNGKey, env: Env, num_simulations: int) -> chex.Arra
         max_depth=env.depth + 1,
         qtransform=functools.partial(mctx.qtransform_by_min_max, min_value=0, max_value=1),
         dirichlet_fraction=0.0,
-        c_param=1.414,
-        num_samples=2,
+        # c_param=1.25,
+        # num_samples=200,
     )
     return policy_output
 
 
 env = env_reset(
     start = [0, 0],
-    depth = 5,
+    depth = 7,
     num_actions = 2,
 )
 
-policy_output = run_mcts(jax.random.PRNGKey(32), env, 100)
+policy_output = run_mcts(jax.random.PRNGKey(0), env, 7000)
 # print(policy_output.search_tree.summary().qvalues)
 print(policy_output.search_tree.summary().qvalues.mean(axis=0))
 print(policy_output.search_tree.summary().qvalues.max(axis=0))

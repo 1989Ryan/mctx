@@ -35,19 +35,14 @@ def switching_action_selection_wrapper_parallel(
       rng_key: chex.PRNGKey,
       tree: tree_lib.Tree,
       node_index: base.NodeIndices,
-      depth: base.Depth) -> chex.Array:
+      depth: base.Depth,
+      # num_samples: int,
+      *param) -> chex.Array:
     return jnp.where(
         depth == 0,
-        root_action_selection_fn(rng_key, tree, node_index),
-        interior_action_selection_fn(rng_key, tree, node_index, depth)
-  
+        root_action_selection_fn(rng_key, tree, node_index, *param),
+        interior_action_selection_fn(rng_key, tree, node_index, depth, *param)
     )
-    # return jax.lax.cond(
-    #     depth == 0,
-    #     lambda x: root_action_selection_fn(*x[:3]),
-    #     lambda x: interior_action_selection_fn(*x),
-    #     (rng_key, tree, node_index, depth))
-
   return switching_action_selection_fn_parallel
 
 
@@ -190,10 +185,13 @@ def maximum_entropy_action_selection(
   
   return masked_choice(rng_key, policy_weights, tree.root_invalid_actions * (depth == 0))
 
+@jax.jit
 def sample_point_distribution(target_distribution, total_samples, visiting_counts, num_choices = 1):
     # Compute ideal counts for each category
-    ideal_counts = (total_samples + num_choices) * target_distribution
-    
+    # print("target_distribution shape {}", target_distribution.shape)
+    # print("total_samples shape {}", total_samples.shape)
+    ideal_counts = jnp.dot(total_samples + num_choices, target_distribution)
+    # jax.debug.print("ideal counts shape {info}", info=ideal_counts.shape)
     # Compute remaining samples needed
     remaining_samples = jnp.maximum(ideal_counts - visiting_counts, 0)
     
@@ -210,6 +208,7 @@ def delta_pikl_action_sampling_parallel(
     depth: chex.Numeric,
     *,
     c_param: float = 1.414,
+    num_samples: int = 1,
     qtransform: base.QTransform = qtransforms.qtransform_by_parent_and_siblings,
 ) -> chex.Array:
   """Returns the action selected for a node index.
@@ -231,17 +230,18 @@ def delta_pikl_action_sampling_parallel(
   # pb_c = pb_c_init + jnp.log((node_visit + pb_c_base + 1.) / pb_c_base)
   # UCT action selection
   # policy_score = c_param * jnp.sqrt(jnp.log(node_visit + 1) / (visit_counts + 1e-4))
+  num_samples = visit_counts.shape[0]
   values = jax.vmap(qtransform, in_axes=[None, 0])(tree, node_index)
   policy_weights = jax.vmap(compute_pikl_weights, in_axes=[0, 0, None, None, 0])(values, 
             node_visit, tree.num_actions, c_param, jnp.ones_like(visit_counts) / len(visit_counts))
-
-  # adjust_probs = jax.vmap(sample_point_distribution)(\
-  #   policy_weights, node_visit, visit_counts)
+  # jax.debug.print("policy weights shape {info}", info=policy_weights.shape)
+  # to_sample =  policy_weights
+  adjust_probs = sample_point_distribution(policy_weights, node_visit, visit_counts, num_samples / tree.num_actions)
   # to_sample = policy_weights
   # to_sample = adjust_probs
-  to_sample =  policy_weights
+  to_sample =  0.5 * adjust_probs + 0.5 * policy_weights
+  # jax.debug.print("rng_key shape {info}", info=rng_key.shape)
   return jax.vmap(masked_choice, in_axes=[0, 0, None])(rng_key, to_sample, None)
-  # return jax.vmap(masked_choice, in_axes=[0, 0, None])(rng_key, to_sample, tree.root_invalid_actions * (depth == 0))
 
 
 
