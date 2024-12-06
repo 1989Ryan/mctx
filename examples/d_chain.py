@@ -36,12 +36,6 @@ def env_reset(start,  depth, num_actions):
         uniform_logits = jnp.ones(num_actions)
     )
 
-    # return Env(
-    #     board=jnp.zeros((6, 7), dtype=jnp.int8),
-    #     player=jnp.int8(1),
-    #     done=jnp.bool_(False),
-    #     reward=jnp.int8(0),
-    # )
 
 def valid_action_mask(env: Env) -> chex.Array:
     return jnp.where(env.done, False, True)
@@ -77,7 +71,7 @@ def env_step(env: Env, action: chex.Array) -> tuple[Env, chex.Array, chex.Array]
         uniform_logits=env.uniform_logits)
     return new_env, reward, done
 
-@jax.jit
+# @jax.jit
 def rollout(env: Env, rng_key: chex.PRNGKey) -> chex.Array:
     def cond(inputs):
         env, key = inputs
@@ -115,20 +109,22 @@ def recurrent_fn(params, rng_key, action, embedding):
     )
     return recurrent_fn_output, env
 
-@functools.partial(jax.jit, static_argnums=(2,))
+# @functools.partial(jax.jit, static_argnums=(2,))
 def run_mcts(rng_key: chex.PRNGKey, env: Env, num_simulations: int) -> chex.Array:
-    batch_size = 128
-
+    batch_size = 1
+    jax.debug.print("{info}", info=env.depth)
     key1, key2 = jax.random.split(rng_key)
-    policy_output = mctx.pikl_policy(
+    policy_output = mctx.parallel_pimct_policy(
         params=None,
         rng_key=key1,
-        root=jax.vmap(root_fn, (None, 0))(env, jax.random.split(key2, batch_size)),
+        root=jax.vmap(root_fn, (None, 0), 0)(env, jax.random.split(key2, batch_size)),
         recurrent_fn=jax.vmap(recurrent_fn, (None, 0, 0, 0)),
         num_simulations=num_simulations,
-        max_depth=30,
+        max_depth=env.depth + 1,
         qtransform=functools.partial(mctx.qtransform_by_min_max, min_value=0, max_value=1),
         dirichlet_fraction=0.0,
+        c_param=1.414,
+        num_samples=2,
     )
     return policy_output
 
@@ -139,8 +135,9 @@ env = env_reset(
     num_actions = 2,
 )
 
-policy_output = run_mcts(jax.random.PRNGKey(0), env, 1000)
+policy_output = run_mcts(jax.random.PRNGKey(32), env, 100)
 # print(policy_output.search_tree.summary().qvalues)
 print(policy_output.search_tree.summary().qvalues.mean(axis=0))
 print(policy_output.search_tree.summary().qvalues.max(axis=0))
+print(policy_output.search_tree.summary().visit_counts.mean(axis=0))
 print(policy_output.action_weights.mean(axis=0))
