@@ -16,10 +16,10 @@ class BlockV1(nn.Module):
     def __call__(self, x, is_training):
         i = x
         x = nn.Conv(self.num_channels, kernel_size=3)(x)
-        x = nn.BatchNorm(momentum=0.9)(x, not is_training)
+        x = nn.BatchNorm(momentum=0.9)(x, use_running_average=not is_training)
         x = nn.relu(x)
         x = nn.Conv(self.num_channels, kernel_size=3)(x)
-        x = nn.BatchNorm(momentum=0.9)(x, not is_training)
+        x = nn.BatchNorm(momentum=0.9)(x, use_running_average=not is_training)
         return nn.relu(x + i)
 
 
@@ -29,10 +29,10 @@ class BlockV2(nn.Module):
     @nn.compact
     def __call__(self, x, is_training, ):
         i = x
-        x = nn.BatchNorm(momentum=0.9)(x, not is_training)
+        x = nn.BatchNorm(momentum=0.9)(x, use_running_average=not is_training)
         x = nn.relu(x)
         x = nn.Conv(self.num_channels, kernel_size=3)(x)
-        x = nn.BatchNorm(momentum=0.9)(x, not is_training)
+        x = nn.BatchNorm(momentum=0.9)(x, use_running_average=not is_training)
         x = nn.relu(x)
         x = nn.Conv(self.num_channels, kernel_size=3)(x)
         return x + i
@@ -58,7 +58,7 @@ class AZNet(nn.Module):
         x = nn.Conv(self.num_channels, kernel_size=3)(x)
 
         if not self.resnet_v2:
-            x = nn.BatchNorm(momentum=0.9)(x, not is_training)
+            x = nn.BatchNorm(momentum=0.9)(x, use_running_average=not is_training)
             x = nn.relu(x)
 
         for i in range(self.num_blocks):
@@ -67,12 +67,12 @@ class AZNet(nn.Module):
             )
 
         if self.resnet_v2:
-            x = nn.BatchNorm(momentum=0.9)(x, not is_training)
+            x = nn.BatchNorm(momentum=0.9)(x, use_running_average=not is_training)
             x = nn.relu(x)
 
         # policy head
         logits = nn.Conv(features=2, kernel_size=1)(x)
-        logits = nn.BatchNorm(momentum=0.9)(logits, not is_training)
+        logits = nn.BatchNorm(momentum=0.9)(logits, use_running_average=not is_training)
         logits = nn.relu(logits)
         # logits = nn.Flatten()(logits)
         logits = flatten(logits)
@@ -80,7 +80,7 @@ class AZNet(nn.Module):
 
         # value head
         v = nn.Conv(features=1, kernel_size=1)(x)
-        v = nn.BatchNorm(momentum=0.9)(v, not is_training)
+        v = nn.BatchNorm(momentum=0.9)(v, use_running_average=not is_training)
         v = nn.relu(v)
         # v = nn.Flatten()(v)
         v = flatten(v)

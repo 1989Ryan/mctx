@@ -33,6 +33,7 @@ from pydantic import BaseModel
 from network import AZNet
 
 devices = jax.local_devices()
+devices = [devices[i] for i in range(2)]
 num_devices = len(devices)
 
 
@@ -46,7 +47,7 @@ class Config(BaseModel):
     resnet_v2: bool = True
     # selfplay params
     selfplay_batch_size: int = 1024
-    num_simulations: int = 32
+    num_simulations: int = 100
     max_num_steps: int = 256
     # training params
     training_batch_size: int = 4096
@@ -128,7 +129,12 @@ class SelfplayOutput(NamedTuple):
 
 @jax.pmap
 def selfplay(model, rng_key: jnp.ndarray) -> SelfplayOutput:
-    model_params, model_state = model['params'], model['batch_stats']
+    if isinstance(model, tuple):
+        model_params, model_state = model
+    elif isinstance(model, dict):
+        model_params, model_state = model['params'], model['batch_stats']
+    else:
+        raise ValueError("model should be a tuple or a dict, but got {}".format(type(model)))
     batch_size = config.selfplay_batch_size // num_devices
 
     def step_fn(state, key) -> SelfplayOutput:
@@ -214,7 +220,7 @@ def loss_fn(model_params, model_state, samples: Sample):
     (logits, value), model_state = forward.apply(
         {'params': model_params, 'batch_stats': model_state},
         # model_params, model_state, 
-        samples.obs, is_training=True
+        samples.obs, is_training=True, mutable='batch_stats',
     )
 
     policy_loss = optax.softmax_cross_entropy(logits, samples.policy_tgt)
@@ -228,14 +234,19 @@ def loss_fn(model_params, model_state, samples: Sample):
 
 @partial(jax.pmap, axis_name="i")
 def train(model, opt_state, data: Sample):
-    model_params, model_state = model['params'], model['batch_stats']
+    if isinstance(model, tuple):
+        model_params, model_state = model
+    elif isinstance(model, dict):
+        model_params, model_state = model['params'], model['batch_stats']
+    else:
+        raise ValueError("model should be a tuple or a dict, but got {}".format(type(model)))
     grads, (model_state, policy_loss, value_loss) = jax.grad(loss_fn, has_aux=True)(
         model_params, model_state, data
     )
     grads = jax.lax.pmean(grads, axis_name="i")
     updates, opt_state = optimizer.update(grads, opt_state)
     model_params = optax.apply_updates(model_params, updates)
-    model = (model_params, model_state)
+    model = {'params': model_params, 'batch_stats': model_state}
     return model, opt_state, policy_loss, value_loss
 
 
