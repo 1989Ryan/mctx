@@ -155,7 +155,7 @@ def parallel_pimct_search(
     invalid_actions = jnp.zeros_like(root.prior_logits)
 
   def body_fun(sim, loop_state):
-    jax.debug.print("sim {sim} / {total}", sim=sim, total=num_simulations)
+    # jax.debug.print("sim {sim} / {total}", sim=sim, total=num_simulations)
     rng_key, tree, last_node_index = loop_state
     rng_key, simulate_key, expand_key = jax.random.split(rng_key, 3)
     # simulate is vmapped and expects batched rng keys.
@@ -441,7 +441,7 @@ def search(
     invalid_actions = jnp.zeros_like(root.prior_logits)
 
   def body_fun(sim, loop_state):
-    jax.debug.print("sim {sim} / {total}", sim=sim, total=num_simulations)
+    # jax.debug.print("sim {sim} / {total}", sim=sim, total=num_simulations)
     rng_key, tree = loop_state
     rng_key, simulate_key, expand_key = jax.random.split(rng_key, 3)
     # simulate is vmapped and expects batched rng keys.
@@ -650,7 +650,7 @@ def parallel_segment_counting(value, node_index, num_nodes):
       jnp.ones_like(value), node_index, num_nodes)
   return index_nums
 
-# @functools.partial(jax.jit, static_argnames=["recurrent_fn"])
+@functools.partial(jax.jit, static_argnames=["recurrent_fn", "num_choices"])
 def parallel_expand(
     params: chex.Array,
     rng_key: chex.PRNGKey,
@@ -709,7 +709,6 @@ def parallel_expand(
   # index_nums = jax.vmap(jax.ops.segment_sum, in_axes=(0, 0, None), out_axes=0)(
   #     jnp.ones_like(step.value), next_node_index, tree.node_values.shape[1])
   step_values = parallel_segment_average(step.value, next_node_index, tree.node_values.shape[1], batch_size, num_choices)
-  @jax.jit 
   def loop_body(index, inputs):
     tree, step_values, next_node_index = inputs
     tree = update_tree_node(tree, next_node_index.at[:, index].get(), 
@@ -720,7 +719,6 @@ def parallel_expand(
 
   tree, _, _ = jax.lax.fori_loop(0, num_choices, loop_body, (tree, step_values, next_node_index))
 
-  @jax.jit
   def loop_replace(index, inputs):
     tree, next_node_index_, parent_index_, action_, step_ = inputs
     next_node_index = next_node_index_.at[:, index].get()
@@ -923,11 +921,7 @@ def pimct_backward_parallel(
     tree = tree.replace(
         node_values=update(tree.node_values, parent_value, parent),
         node_visits=update(tree.node_visits, count + 1, parent),
-        # children_values=update(
-        #     tree.children_values, children_values, parent, action),
-        # children_visits=update(
-        #     tree.children_visits, children_counts, parent, action)
-            )
+    )
 
     return tree, leaf_value, parent
 
@@ -1108,6 +1102,7 @@ def update_tree_node_parallel(
 
   return tree.replace(**updates)
 
+@jax.jit
 def update_tree_node(
     tree: Tree[T],
     node_index: chex.Array,

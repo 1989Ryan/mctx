@@ -113,13 +113,13 @@ def recurrent_fn(params, rng_key, action, embedding):
     return recurrent_fn_output, env
 
 available_devices = jax.devices()
-@functools.partial(jax.jit, static_argnums=(2,), device=available_devices[1])
+@functools.partial(jax.jit, static_argnums=(2,), device=available_devices[2])
 def run_mcts(rng_key: chex.PRNGKey, env: Env, num_simulations: int) -> chex.Array:
-    batch_size = 16
+    batch_size = 32
     jax.debug.print("{info}", info=env.depth)
     key1, key2 = jax.random.split(rng_key)
-    policy_output = mctx.muzero_policy(
-    # policy_output = mctx.parallel_pimct_policy(
+    # policy_output = mctx.gumbel_muzero_policy(
+    policy_output = mctx.parallel_pimct_policy(
         params=None,
         rng_key=key1,
         root=jax.vmap(root_fn, (None, 0), 0)(env, jax.random.split(key2, batch_size)),
@@ -128,21 +128,22 @@ def run_mcts(rng_key: chex.PRNGKey, env: Env, num_simulations: int) -> chex.Arra
         max_depth=env.depth + 1,
         qtransform=functools.partial(mctx.qtransform_by_min_max, min_value=0, max_value=1),
         dirichlet_fraction=0.0,
-        # c_param=1.25,
-        # num_samples=200,
+        c_param=1.25,
+        num_samples=300,
     )
     return policy_output
 
 
 env = env_reset(
     start = [0, 0],
-    depth = 7,
+    depth = 8,
     num_actions = 2,
 )
 
-policy_output = run_mcts(jax.random.PRNGKey(0), env, 7000)
+policy_output = run_mcts(jax.random.PRNGKey(0), env, 50)
 # print(policy_output.search_tree.summary().qvalues)
 print(policy_output.search_tree.summary().qvalues.mean(axis=0))
 print(policy_output.search_tree.summary().qvalues.max(axis=0))
+print(policy_output.search_tree.summary().qvalues.min(axis=0))
 print(policy_output.search_tree.summary().visit_counts.mean(axis=0))
 print(policy_output.action_weights.mean(axis=0))
