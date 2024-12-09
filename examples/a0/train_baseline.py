@@ -14,8 +14,6 @@
 
 import datetime
 import os
-
-os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3'
 import pickle
 import time
 from functools import partial
@@ -35,9 +33,7 @@ from pydantic import BaseModel
 from network import AZNet
 
 devices = jax.local_devices()
-print(devices)
-# devices = [devices[i] for i in range(2)]
-# devices = [devices[i] for i in range(2, 4)]
+devices = [devices[i] for i in range(2)]
 num_devices = len(devices)
 
 
@@ -51,8 +47,7 @@ class Config(BaseModel):
     resnet_v2: bool = True
     # selfplay params
     selfplay_batch_size: int = 1024
-    num_simulations: int = 100
-    num_samples: int = 1
+    num_simulations: int = 50
     max_num_steps: int = 256
     # training params
     training_batch_size: int = 4096
@@ -71,20 +66,6 @@ print(config)
 env = pgx.make(config.env_id)
 # baseline = pgx.make_baseline_model(config.env_id + "_v0")
 
-# baseline = AZNet(
-#         env.num_actions,
-#         config.num_channels,
-#         config.num_layers,
-#         config.resnet_v2,
-#     )
-
-
-ckpt = "checkpoints/go_9x9_20241208173621/000400.ckpt"
-with open(ckpt, "rb") as f:
-    dic = pickle.load(f)
-    baseline = dic["model"]
-    baseline_model = {'params': baseline['params'], 'batch_stats': baseline['batch_stats']}
-    # baseline_model = jax.device_put_replicated(baseline_model, devices)
 
 # def forward_fn(x, is_training=True):
 #     net = AZNet(
@@ -110,11 +91,11 @@ optimizer = optax.adam(learning_rate=config.learning_rate)
 def recurrent_fn(model, rng_key: jnp.ndarray, action: jnp.ndarray, state: pgx.State):
     # model: params
     # state: embedding
-    # del rng_key
+    del rng_key
     model_params, model_state = model['params'], model['batch_stats']
 
     current_player = state.current_player
-    state = jax.vmap(env.step)(state, action, rng_key)
+    state = jax.vmap(env.step)(state, action)
 
     logits, value = forward.apply(
         # model_params, model_state,
@@ -167,16 +148,15 @@ def selfplay(model, rng_key: jnp.ndarray) -> SelfplayOutput:
         )
         root = mctx.RootFnOutput(prior_logits=logits, value=value, embedding=state)
 
-        policy_output = mctx.sprites_policy(
-            params={'params': model_params, 'batch_stats': model_state},
+        policy_output = mctx.gumbel_muzero_policy(
+            params=model,
             rng_key=key1,
             root=root,
             recurrent_fn=recurrent_fn,
-            num_simulations=config.num_simulations // config.num_samples,
-            num_samples=config.num_samples, 
+            num_simulations=config.num_simulations,
             invalid_actions=~state.legal_action_mask,
             qtransform=mctx.qtransform_completed_by_mix_value,
-            # gumbel_scale=1.0,
+            gumbel_scale=1.0,
         )
         actor = state.current_player
         keys = jax.random.split(key2, batch_size)
@@ -284,61 +264,21 @@ def evaluate(rng_key, my_model):
 
     def body_fn(val):
         key, state, R = val
-        my_logits, my_value= forward.apply(
+        my_logits, _= forward.apply(
             # my_model_params, my_model_state, 
             {'params': my_model_params, 'batch_stats': my_model_state},
             state.observation, is_training=False
         )
-
-        # key1, key = jax.random.split(key)
-        # root = mctx.RootFnOutput(prior_logits=my_logits, value=my_value, embedding=state)
-
-        # my_output = mctx.sprites_policy(
-        #     params={'params': my_model_params, 'batch_stats': my_model_state},
-        #     # params={'params': baseline_model['params'], \
-        #     #         'batch_stats': baseline_model['batch_stats']},
-        #     rng_key=key1,
-        #     root=root,
-        #     recurrent_fn=recurrent_fn,
-        #     num_simulations=config.num_simulations // config.num_samples,
-        #     # num_samples=, 
-        #     num_samples=config.num_samples, 
-        #     invalid_actions=~state.legal_action_mask,
-        #     qtransform=mctx.qtransform_completed_by_mix_value,
-        #     # gumbel_scale=1.0,
-        # )
-
-
-
-        opp_logits, opp_value = forward.apply(
+        opp_logits, _ = forward.apply(
             # my_model_params, my_model_state, 
-            {'params': baseline_model['params'], 'batch_stats': baseline_model['batch_stats']},
+            {'params': my_model_params, 'batch_stats': my_model_state},
             state.observation, is_training=False
         )
         # opp_logits, _ = baseline(state.observation)
-        key, subkey = jax.random.split(key)
-        # greedy_action = jax.random.categorical(subkey, opp_logits, axis=-1)
-        # root = mctx.RootFnOutput(prior_logits=opp_logits, value=opp_value, embedding=state)
-
-        # key1, key = jax.random.split(key)
-        # base_output = mctx.gumbel_muzero_policy(
-        #     params={'params': baseline_model['params'], 'batch_stats': baseline_model['batch_stats']},
-        #     rng_key=key1,
-        #     root=root,
-        #     recurrent_fn=recurrent_fn,
-        #     num_simulations=config.num_simulations,
-        #     invalid_actions=~state.legal_action_mask,
-        #     qtransform=mctx.qtransform_completed_by_mix_value,
-        #     gumbel_scale=1.0,
-        # )
-
-
         is_my_turn = (state.current_player == my_player).reshape((-1, 1))
-        # action = jnp.where(is_my_turn, my_output.action, greedy_action, )
         logits = jnp.where(is_my_turn, my_logits, opp_logits)
+        key, subkey = jax.random.split(key)
         action = jax.random.categorical(subkey, logits, axis=-1)
-        # action = jnp.where(is_my_turn, my_output.action, base_output.action, )
-        # print(action.shape)
         state = jax.vmap(env.step)(state, action)
         R = R + state.rewards[jnp.arange(batch_size), my_player]
         return (key, state, R)

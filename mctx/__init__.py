@@ -22,6 +22,7 @@ from mctx._src.action_selection import uct_action_selection
 from mctx._src.action_selection import pikl_action_selection
 from mctx._src.action_selection import delta_pikl_action_selection
 from mctx._src.action_selection import delta_pikl_action_sampling_parallel
+from mctx._src.action_selection import delta_pikl_puct_action_sampling_parallel
 from mctx._src.action_selection import maximum_entropy_action_selection
 from mctx._src.base import ChanceRecurrentFnOutput
 from mctx._src.base import DecisionRecurrentFnOutput
@@ -41,11 +42,13 @@ from mctx._src.policies import delta_pikl_policy
 from mctx._src.policies import ments_policy
 from mctx._src.policies import pimct_policy
 from mctx._src.policies import parallel_pimct_policy
+from mctx._src.policies import sprites_policy
 from mctx._src.policies import stochastic_muzero_policy
 from mctx._src.qtransforms import qtransform_by_min_max
 from mctx._src.qtransforms import qtransform_by_parent_and_siblings
 from mctx._src.qtransforms import qtransform_completed_by_mix_value
 from mctx._src.search import search
+from mctx._src.search import sprites_search
 from mctx._src.tree import Tree
 
 __version__ = "0.0.5"
@@ -69,13 +72,23 @@ __all__ = (
     "muzero_action_selection",
     "uct_action_selection",
     "pikl_action_selection",
+    "delta_pikl_action_selection",
+    "delta_pikl_action_sampling_parallel",
+    "delta_pikl_puct_action_sampling_parallel",
+    "maximum_entropy_action_selection",
     "muzero_policy",
     "uct_policy",
     "pikl_policy",
+    "delta_pikl_policy",
+    "ments_policy",
+    "pimct_policy",
+    "parallel_pimct_policy",
+    "sprites_policy",
     "qtransform_by_min_max",
     "qtransform_by_parent_and_siblings",
     "qtransform_completed_by_mix_value",
     "search",
+    "sprites_search",
     "stochastic_muzero_policy",
 )
 
