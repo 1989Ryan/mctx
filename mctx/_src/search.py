@@ -401,6 +401,122 @@ def pimct_search(
   return tree
 
 
+def sprites_muzero_search(
+    params: base.Params,
+    rng_key: chex.PRNGKey,
+    *,
+    root: base.RootFnOutput,
+    recurrent_fn: base.RecurrentFn,
+    root_action_selection_fn: base.RootActionSelectionFn,
+    interior_action_selection_fn: base.InteriorActionSelectionFn,
+    num_simulations: int,
+    max_depth: Optional[int] = None,
+    invalid_actions: Optional[chex.Array] = None,
+    extra_data: Any = None,
+    pb_c_base: chex.Numeric = 1.25,
+    pb_c_init: chex.Numeric = 19652,
+    loop_fn: base.LoopFn = jax.lax.fori_loop,
+    qtransform: base.QTransform = qtransforms.qtransform_by_parent_and_siblings) -> Tree:
+  """Performs a full search and returns sampled actions.
+
+  In the shape descriptions, `B` denotes the batch dimension.
+
+  Args:
+    params: params to be forwarded to root and recurrent functions.
+    rng_key: random number generator state, the key is consumed.
+    root: a `(prior_logits, value, embedding)` `RootFnOutput`. The
+      `prior_logits` are from a policy network. The shapes are
+      `([B, num_actions], [B], [B, ...])`, respectively.
+    recurrent_fn: a callable to be called on the leaf nodes and unvisited
+      actions retrieved by the simulation step, which takes as args
+      `(params, rng_key, action, embedding)` and returns a `RecurrentFnOutput`
+      and the new state embedding. The `rng_key` argument is consumed.
+    root_action_selection_fn: function used to select an action at the root.
+    interior_action_selection_fn: function used to select an action during
+      simulation.
+    num_simulations: the number of simulations.
+    max_depth: maximum search tree depth allowed during simulation, defined as
+      the number of edges from the root to a leaf node.
+    invalid_actions: a mask with invalid actions at the root. In the
+      mask, invalid actions have ones, and valid actions have zeros.
+      Shape `[B, num_actions]`.
+    extra_data: extra data passed to `tree.extra_data`. Shape `[B, ...]`.
+    loop_fn: Function used to run the simulations. It may be required to pass
+      hk.fori_loop if using this function inside a Haiku module.
+
+  Returns:
+    `SearchResults` containing outcomes of the search, e.g. `visit_counts`
+    `[B, num_actions]`.
+  """
+  action_selection_fn = action_selection.switching_action_selection_wrapper_parallel(
+      root_action_selection_fn=root_action_selection_fn,
+      interior_action_selection_fn=interior_action_selection_fn
+  )
+
+  # Do simulation, expansion, and backward steps.
+  batch_size = root.value.shape[0]
+  batch_range = jnp.arange(batch_size)
+  # batch_range = jnp.repeat(jnp.expand_dims(batch_range, axis=1), num_choices, axis=1)
+  if max_depth is None:
+    max_depth = num_simulations
+  if invalid_actions is None:
+    invalid_actions = jnp.zeros_like(root.prior_logits)
+
+  def body_fun(sim, loop_state):
+    # jax.debug.print("sim {sim} / {total}", sim=sim, total=num_simulations)
+    rng_key, tree, last_node_index = loop_state
+    rng_key, simulate_key, expand_key = jax.random.split(rng_key, 3)
+    # simulate is vmapped and expects batched rng keys.
+    simulate_keys = jax.random.split(simulate_key, batch_size)
+    # jax.debug.print("simulate running")
+    parent_index, action = simulate(
+        simulate_keys, tree, action_selection_fn, max_depth)
+    # parent_index, action = parallel_sampling_simulate(
+    #     simulate_keys, tree, num_choices, action_selection_fn, max_depth)
+    # jax.debug.print("simulate done")
+    # A node first expanded on simulation `i`, will have node index `i`.
+    # assign unique next node index 
+    next_node_index = tree.children_index[batch_range, parent_index, action]
+    next_node_index = jnp.where(next_node_index == Tree.UNVISITED,
+                                sim + 1, next_node_index)
+    # next_node_index, last_node_index = assign_unique_indices(tree, batch_range, parent_index, action, last_node_index)
+    # jax.debug.print("expand running")
+    tree = expand(
+        params, expand_key, tree, recurrent_fn, parent_index,
+        action, next_node_index)
+    tree = pimct_backward(tree, next_node_index, pb_c_init, pb_c_base, qtransform)
+    loop_state = rng_key, tree
+    # jax.debug.print("expand done")
+    # def loop_backward(index, inputs):
+    #   tree, next_node_index_ = inputs
+    #   # jax.debug.print("backward {index}", index=index) 
+    #   next_node_index = next_node_index_.at[:, index].get()
+    #   # jax.debug.print("next_node_index shape {next_node_index_}", next_node_index_=next_node_index.shape)
+    #   tree = pimct_backward(tree, next_node_index, pb_c_init, pb_c_base, qtransform)
+    #   # jax.debug.print("tree shape {tree}", tree=tree.children_index.shape)
+    #   return tree, next_node_index_
+    # jax.debug.print("backward running")
+    # tree, _ = jax.lax.fori_loop(0, num_choices, loop_backward, (tree, next_node_index))
+    # jax.debug.print("backward done")
+    # tree = pimct_backward_parallel(tree, next_node_index, c_param, qtransform)
+    # jax.debug.print("rng_key {rng_key}", rng_key=rng_key)
+    # jax.debug.print("tree shape {tree}", tree=tree.children_index.shape)
+    # jax.debug.print("last_node_index {last_node_index}", last_node_index=next_node_index)
+    loop_state = rng_key, tree, last_node_index
+    # jax.debug.print("return loop state")
+    # jax.debug.print("Num simulations in total {sim}", sim=num_simulations)
+    return loop_state
+
+  # Allocate all necessary storage.
+  tree = instantiate_tree_from_root(root, num_simulations,
+                                    root_invalid_actions=invalid_actions,
+                                    extra_data=extra_data)
+  _, tree, _ = loop_fn(
+      0, num_simulations, body_fun, (rng_key, tree, jnp.zeros(batch_size)))
+
+  return tree
+
+
 
 def ments_search(
     params: base.Params,
@@ -1161,11 +1277,14 @@ def pimct_backward(
     children_values = tree.children_values[parent]
     policy_weights = action_selection.compute_pikl_puct_weights(
       children_values, prior_probs, count, tree.num_actions, pb_c)
-      
+    # policy_weights = jnp.where(tree.children_visits[parent] > 0, policy_weights, jnp.zeros_like(policy_weights, dtype=jnp.float32))
+    # policy_weights = policy_weights / (jnp.sum(policy_weights, axis=-1) + 1e-6)
+    # jax.debug.print("policy_weights {policy_weights}", policy_weights=policy_weights)
+
     parent_value = count * jnp.dot(policy_weights,  \
       tree.children_rewards[parent] + tree.children_discounts[parent] * children_values) / (count + 1) \
       + tree.raw_values[parent]  / (count + 1)
-    # parent_value = jnp.dot(policy_weights, children_values)
+
 
     tree = tree.replace(
         node_values=update(tree.node_values, parent_value, parent),

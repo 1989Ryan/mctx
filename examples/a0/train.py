@@ -15,7 +15,7 @@
 import datetime
 import os
 
-os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3'
+os.environ['CUDA_VISIBLE_DEVICES'] = '3'
 import pickle
 import time
 from functools import partial
@@ -52,7 +52,7 @@ class Config(BaseModel):
     # selfplay params
     selfplay_batch_size: int = 1024
     num_simulations: int = 100
-    num_samples: int = 1
+    num_samples: int = 12
     max_num_steps: int = 256
     # training params
     training_batch_size: int = 4096
@@ -166,7 +166,18 @@ def selfplay(model, rng_key: jnp.ndarray) -> SelfplayOutput:
             state.observation, is_training=False
         )
         root = mctx.RootFnOutput(prior_logits=logits, value=value, embedding=state)
-
+        # if config.num_samples == 1:
+        #     policy_output = mctx.sprites_muzero_policy(
+        #         params={'params': model_params, 'batch_stats': model_state},
+        #         rng_key=key1,
+        #         root=root,
+        #         recurrent_fn=recurrent_fn,
+        #         num_simulations=config.num_simulations,
+        #         invalid_actions=~state.legal_action_mask,
+        #         qtransform=mctx.qtransform_completed_by_mix_value,
+        #         # gumbel_scale=1.0,
+        #     )
+        # else:
         policy_output = mctx.sprites_policy(
             params={'params': model_params, 'batch_stats': model_state},
             rng_key=key1,
@@ -350,7 +361,8 @@ def evaluate(rng_key, my_model):
 
 
 if __name__ == "__main__":
-    wandb.init(project="pgx-az", config=config.model_dump())
+    wandb.init(project="pgx-az", name=f"samples: {config.num_samples}",\
+            config=config.model_dump())
 
     # Initialize model and opt_state
     dummy_state = jax.vmap(env.init)(jax.random.split(jax.random.PRNGKey(0), 2))

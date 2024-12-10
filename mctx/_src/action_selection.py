@@ -113,7 +113,7 @@ def uct_action_selection(
 
 @jax.jit
 def compute_pikl_puct_weights(q, prior_logits, visits, num_children, c_param):
-    lambda_N = c_param * jnp.sqrt(visits) / (visits + 1.0) 
+    lambda_N = c_param * jnp.sqrt(visits) / (visits + num_children) 
     alpha_min = jnp.max(q + lambda_N * prior_logits)
     alpha_max = jnp.max(q + lambda_N)    
 
@@ -290,11 +290,11 @@ def delta_pikl_puct_action_sampling_parallel(
   adjust_probs = sample_point_distribution(policy_weights, node_visit, visit_counts, unique_count)
   # to_sample = policy_weights
   # to_sample = adjust_probs
-  # node_noise_score = 1e-7 * jax.vmap(jax.random.uniform, in_axes=(0, None))(
-  #     rng_key, (tree.num_actions,))
+  node_noise_score = 1e-7 * jax.vmap(jax.random.uniform, in_axes=(0, None))(
+      rng_key, (tree.num_actions,))
   # to_sample = policy_weights + node_noise_score
   # to_sample = policy_weights 
-  to_sample = 0.5 * adjust_probs + 0.5 * policy_weights 
+  to_sample = 0.5 * adjust_probs + 0.5 * policy_weights + node_noise_score
   invalid_actions_root = jnp.repeat(tree.root_invalid_actions[None, :], num_samples, axis=0)
   # mask = jnp.where(depth == 0, invalid_actions_root, jnp.zeros_like(invalid_actions_root))
   mask = invalid_actions_root * jnp.repeat((depth == 0)[:, None], tree.num_actions, axis=1)
