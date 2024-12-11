@@ -44,6 +44,7 @@ from mctx._src.policies import pimct_policy
 from mctx._src.policies import parallel_pimct_policy
 from mctx._src.policies import sprites_policy
 from mctx._src.policies import sprites_muzero_policy
+from mctx._src.policies import sprites_gumbel_muzero_policy
 from mctx._src.policies import stochastic_muzero_policy
 from mctx._src.qtransforms import qtransform_by_min_max
 from mctx._src.qtransforms import qtransform_by_parent_and_siblings

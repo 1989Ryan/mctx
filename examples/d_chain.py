@@ -130,7 +130,7 @@ def run_mcts(rng_key: chex.PRNGKey, env: Env, num_simulations: int) -> chex.Arra
         qtransform=functools.partial(mctx.qtransform_by_min_max, min_value=0, max_value=1),
         dirichlet_fraction=0.0,
         # c_param=1.414,
-        num_samples=1,
+        num_samples=10,
     )
     return policy_output
 

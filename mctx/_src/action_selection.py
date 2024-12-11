@@ -113,7 +113,7 @@ def uct_action_selection(
 
 @jax.jit
 def compute_pikl_puct_weights(q, prior_logits, visits, num_children, c_param):
-    lambda_N = c_param * jnp.sqrt(visits) / (visits + num_children) 
+    lambda_N = c_param * jnp.sqrt(visits) / (visits + 1e-4) 
     alpha_min = jnp.max(q + lambda_N * prior_logits)
     alpha_max = jnp.max(q + lambda_N)    
 
@@ -277,27 +277,32 @@ def delta_pikl_puct_action_sampling_parallel(
   # UCT action selection
   pb_c = pb_c_init + jnp.log((node_visit + pb_c_base + 1.) / pb_c_base)
   # policy_score = c_param * jnp.sqrt(jnp.log(node_visit + 1) / (visit_counts + 1e-4))
+  # jax.debug.print("node_index shape {info}", info=node_index.shape)
   prior_logits = tree.children_prior_logits[node_index]
+  # jax.debug.print("prior logits shape {info}", info=prior_logits.shape)
   prior_probs = jax.nn.softmax(prior_logits)
   num_samples = visit_counts.shape[0]
   values = jax.vmap(qtransform, in_axes=[None, 0])(tree, node_index)
   policy_weights = jax.vmap(compute_pikl_puct_weights, in_axes=[0, 0, 0, None, 0,])(values, prior_probs, 
-            node_visit, tree.num_actions, pb_c)
+            node_visit + 1, tree.num_actions, pb_c)
 
   # jax.debug.print("policy weights shape {info}", info=policy_weights.shape)
   # to_sample =  policy_weights
   unique_count = count_elements(node_index) 
-  adjust_probs = sample_point_distribution(policy_weights, node_visit, visit_counts, unique_count)
+  adjust_probs = sample_point_distribution(policy_weights, node_visit - 1, visit_counts, unique_count)
   # to_sample = policy_weights
-  # to_sample = adjust_probs
-  node_noise_score = 1e-7 * jax.vmap(jax.random.uniform, in_axes=(0, None))(
-      rng_key, (tree.num_actions,))
+  to_sample = adjust_probs
+  # node_noise_score = 1e-7 * jax.vmap(jax.random.uniform, in_axes=(0, None))(
+  #     rng_key, (tree.num_actions,))
   # to_sample = policy_weights + node_noise_score
   # to_sample = policy_weights 
-  to_sample = 0.5 * adjust_probs + 0.5 * policy_weights + node_noise_score
+  # to_sample = 0.5 * adjust_probs + 0.5 * policy_weights  #+ node_noise_score
   invalid_actions_root = jnp.repeat(tree.root_invalid_actions[None, :], num_samples, axis=0)
   # mask = jnp.where(depth == 0, invalid_actions_root, jnp.zeros_like(invalid_actions_root))
   mask = invalid_actions_root * jnp.repeat((depth == 0)[:, None], tree.num_actions, axis=1)
+  # to_sample = _get_logits_from_probs(to_sample)
+
+  # return masked_sample(rng_key, to_sample, mask)
   return jax.vmap(masked_choice, in_axes=[0, 0, None, 0])(rng_key, to_sample, tree.num_actions, mask)
 
 def delta_pikl_action_sampling_parallel(

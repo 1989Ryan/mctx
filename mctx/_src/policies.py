@@ -299,17 +299,24 @@ def sprites_muzero_policy(
     `PolicyOutput` containing the proposed action, action_weights and the used
     search tree.
   """
-  rng_key, dirichlet_rng_key, search_rng_key = jax.random.split(rng_key, 3)
+  # rng_key, dirichlet_rng_key, search_rng_key = jax.random.split(rng_key, 3)
+  # rng_key, search_rng_key = jax.random.split(rng_key, 2)
 
   # Adding Dirichlet noise.
-  noisy_logits = _get_logits_from_probs(
-      _add_dirichlet_noise(
-          dirichlet_rng_key,
-          jax.nn.softmax(root.prior_logits),
-          dirichlet_fraction=dirichlet_fraction,
-          dirichlet_alpha=dirichlet_alpha))
+  # noisy_logits = _get_logits_from_probs(
+  #     _add_dirichlet_noise(
+  #         dirichlet_rng_key,
+  #         jax.nn.softmax(root.prior_logits),
+  #         dirichlet_fraction=dirichlet_fraction,
+  #         dirichlet_alpha=dirichlet_alpha))
+  # root = root.replace(
+  #     prior_logits=_mask_invalid_actions(noisy_logits, invalid_actions))
+
+
+  rng_key, search_rng_key = jax.random.split(rng_key, 2)
+
   root = root.replace(
-      prior_logits=_mask_invalid_actions(noisy_logits, invalid_actions))
+      prior_logits=_mask_invalid_actions(root.prior_logits, invalid_actions))
 
   # Running the search.
   interior_action_selection_fn = functools.partial(
@@ -341,20 +348,35 @@ def sprites_muzero_policy(
   num_visits = summary.visit_counts.sum(axis=-1)
   # print(num_visits.shape)
   # print(jnp.ones_like(summary.visit_counts).shape)
-  qvalues = summary.qvalues
+  # qvalues = summary.qvalues
+  qvalues = jax.vmap(qtransform, in_axes=[0, None])(search_tree, search_tree.ROOT_INDEX)
   # print(qvalues.shape)
   # num_actions_batched = jnp.ones_like(num_visits) * search_tree.num_actions
   # print(num_actions_batched.shape)
+
+
+  # action_weights = summary.visit_probs
+  # action_logits = _apply_temperature(
+  #     _get_logits_from_probs(action_weights), temperature)
+  # action = jax.random.categorical(rng_key, action_logits)
+
+  # jax.debug.print("Policy weights 1: {p}", p=action_weights[0])
   pb_c =  pb_c_init + jnp.log((num_visits + pb_c_base + 1.) / pb_c_base)
   action_weights = jax.vmap(action_selection.compute_pikl_puct_weights)(qvalues, jax.nn.softmax(root.prior_logits),
                       num_visits, jnp.ones_like(num_visits) * search_tree.num_actions, 
                       jnp.ones_like(num_visits) * pb_c,)
-
+  # jax.debug.print("prior logits: {p}", p=jax.nn.softmax(root.prior_logits)[0])
+  # jax.debug.print("Policy weights 2: {p}", p=action_weights[0])
+  # jax.debug.print("Policy weights 2 sum: {p}", p=jnp.sum(action_weights[0]))
+  
   action_logits = _apply_temperature(
       _get_logits_from_probs(action_weights), temperature)
   # print(search_tree.children_visits.shape)
   
   action = jax.random.categorical(rng_key, action_logits)
+
+
+
   # print(search_tree.num_actions.shape)
   # action = jax.random.choice(rng_key, search_tree.num_actions, p=action_weights)
   return base.PolicyOutput(
@@ -415,6 +437,7 @@ def sprites_policy(
     `PolicyOutput` containing the proposed action, action_weights and the used
     search tree.
   """
+  # rng_key, search_rng_key = jax.random.split(rng_key, 2)
   rng_key, dirichlet_rng_key, search_rng_key = jax.random.split(rng_key, 3)
 
   # Adding Dirichlet noise.
@@ -426,7 +449,8 @@ def sprites_policy(
           dirichlet_alpha=dirichlet_alpha))
   root = root.replace(
       prior_logits=_mask_invalid_actions(noisy_logits, invalid_actions))
-
+  # root = root.replace(
+  #     prior_logits=_mask_invalid_actions(root.prior_logits, invalid_actions))
   # Running the search.
   interior_action_selection_fn = functools.partial(
       action_selection.delta_pikl_puct_action_sampling_parallel,
@@ -458,7 +482,24 @@ def sprites_policy(
   num_visits = summary.visit_counts.sum(axis=-1)
   # print(num_visits.shape)
   # print(jnp.ones_like(summary.visit_counts).shape)
-  qvalues = summary.qvalues
+  # qvalues = summary.qvalues
+  # print(qvalues.shape)
+  # num_actions_batched = jnp.ones_like(num_visits) * search_tree.num_actions
+  # print(num_actions_batched.shape)
+  # pb_c =  pb_c_init + jnp.log((num_visits + pb_c_base + 1.) / pb_c_base)
+  # action_weights = jax.vmap(action_selection.compute_pikl_puct_weights)(qvalues, jax.nn.softmax(root.prior_logits),
+  #                     num_visits, jnp.ones_like(num_visits) * search_tree.num_actions, 
+  #                     jnp.ones_like(num_visits) * pb_c,)
+
+
+  # action_weights = summary.visit_probs
+  # action_logits = _apply_temperature(
+  #     _get_logits_from_probs(action_weights), temperature)
+  # action = jax.random.categorical(rng_key, action_logits)
+
+  # print(action_weights)
+  # print(search_tree.node_values[search_tree.ROOT_INDEX])
+  qvalues = jax.vmap(qtransform, in_axes=[0, None])(search_tree, search_tree.ROOT_INDEX)
   # print(qvalues.shape)
   # num_actions_batched = jnp.ones_like(num_visits) * search_tree.num_actions
   # print(num_actions_batched.shape)
@@ -466,21 +507,18 @@ def sprites_policy(
   action_weights = jax.vmap(action_selection.compute_pikl_puct_weights)(qvalues, jax.nn.softmax(root.prior_logits),
                       num_visits, jnp.ones_like(num_visits) * search_tree.num_actions, 
                       jnp.ones_like(num_visits) * pb_c,)
-  # print(action_weights)
-
-  # action_weights = jnp.where(summary.visit_counts > 0,  action_weights, jnp.zeros_like(action_weights))
-  # action_weights = action_weights / jnp.sum(action_weights, axis=-1, keepdims=True)
-  # jax.debug.print("Policy weights: {p}", p=action_weights)
-  # jax.debug.print(action_weights)
+  # jax.debug.print("qvalues: {p}", p=qvalues[0]) 
+  # jax.debug.print("prior logits: {p}", p=root.prior_logits[0])
+  # jax.debug.print("action weights: {p}", p=action_weights[0])
   # action_weights = summary.visit_probs
-  # action_weights = action_selection.compute_pikl_weights(qvalues, 
-  #                     num_visits, search_tree.num_actions, 
-  #                     c_param, jnp.ones_like(summary.visit_counts) / search_tree.num_actions)
   action_logits = _apply_temperature(
       _get_logits_from_probs(action_weights), temperature)
-  # print(search_tree.children_visits.shape)
-  
   action = jax.random.categorical(rng_key, action_logits)
+
+  # jax.debug.print("Policy weights 1: {p}", p=action_weights[0])
+
+  
+  # action = jax.random.categorical(rng_key, action_logits)
   # print(search_tree.num_actions.shape)
   # action = jax.random.choice(rng_key, search_tree.num_actions, p=action_weights)
   return base.PolicyOutput(
@@ -1075,6 +1113,7 @@ def muzero_policy(
     search tree.
   """
   rng_key, dirichlet_rng_key, search_rng_key = jax.random.split(rng_key, 3)
+  # rng_key, search_rng_key = jax.random.split(rng_key, 2)
 
   # Adding Dirichlet noise.
   noisy_logits = _get_logits_from_probs(
@@ -1085,6 +1124,10 @@ def muzero_policy(
           dirichlet_alpha=dirichlet_alpha))
   root = root.replace(
       prior_logits=_mask_invalid_actions(noisy_logits, invalid_actions))
+
+  # root = root.replace(
+  #     prior_logits=_mask_invalid_actions(root.prior_logits, invalid_actions))
+
 
   # Running the search.
   interior_action_selection_fn = functools.partial(

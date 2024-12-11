@@ -448,7 +448,7 @@ def sprites_muzero_search(
     `SearchResults` containing outcomes of the search, e.g. `visit_counts`
     `[B, num_actions]`.
   """
-  action_selection_fn = action_selection.switching_action_selection_wrapper_parallel(
+  action_selection_fn = action_selection.switching_action_selection_wrapper(
       root_action_selection_fn=root_action_selection_fn,
       interior_action_selection_fn=interior_action_selection_fn
   )
@@ -464,7 +464,8 @@ def sprites_muzero_search(
 
   def body_fun(sim, loop_state):
     # jax.debug.print("sim {sim} / {total}", sim=sim, total=num_simulations)
-    rng_key, tree, last_node_index = loop_state
+    rng_key, tree = loop_state
+    # rng_key, tree, last_node_index = loop_state
     rng_key, simulate_key, expand_key = jax.random.split(rng_key, 3)
     # simulate is vmapped and expects batched rng keys.
     simulate_keys = jax.random.split(simulate_key, batch_size)
@@ -485,6 +486,8 @@ def sprites_muzero_search(
         params, expand_key, tree, recurrent_fn, parent_index,
         action, next_node_index)
     tree = pimct_backward(tree, next_node_index, pb_c_init, pb_c_base, qtransform)
+
+    # tree = backward(tree, next_node_index)
     loop_state = rng_key, tree
     # jax.debug.print("expand done")
     # def loop_backward(index, inputs):
@@ -502,7 +505,7 @@ def sprites_muzero_search(
     # jax.debug.print("rng_key {rng_key}", rng_key=rng_key)
     # jax.debug.print("tree shape {tree}", tree=tree.children_index.shape)
     # jax.debug.print("last_node_index {last_node_index}", last_node_index=next_node_index)
-    loop_state = rng_key, tree, last_node_index
+    # loop_state = rng_key, tree, last_node_index
     # jax.debug.print("return loop state")
     # jax.debug.print("Num simulations in total {sim}", sim=num_simulations)
     return loop_state
@@ -511,8 +514,8 @@ def sprites_muzero_search(
   tree = instantiate_tree_from_root(root, num_simulations,
                                     root_invalid_actions=invalid_actions,
                                     extra_data=extra_data)
-  _, tree, _ = loop_fn(
-      0, num_simulations, body_fun, (rng_key, tree, jnp.zeros(batch_size)))
+  _, tree = loop_fn(
+      0, num_simulations, body_fun, (rng_key, tree))
 
   return tree
 
@@ -861,8 +864,10 @@ def parallel_find_unique(value, node_index, num_samples):
         )
 
 def parallel_segment_average(value, node_index, num_nodes, batch_size, num_samples):
+  # print(value.shape)
   step_values = jax.vmap(jax.ops.segment_sum, in_axes=(0, 0, None), out_axes=0)(
       value, node_index, num_nodes)
+  # print(step_values.shape)
   index_nums = parallel_segment_counting(value, node_index, num_nodes)
   step_values = step_values / (index_nums + 1e-6) # [B, K], K = num_nodes, N = num_samples
   # averaged_values = jnp.zeros_like(value) # [B, N], value -> step_values[batch_range, node_index]
@@ -1266,34 +1271,46 @@ def pimct_backward(
     child_value = tree.node_values[index]
     prior_logits = tree.children_prior_logits[parent]
     prior_probs = jax.nn.softmax(prior_logits)
+
     tree = tree.replace(
         children_values=update(
             tree.children_values, child_value, parent, action),
         children_visits=update(
             tree.children_visits, child_count, parent, action))
     pb_c = pb_c_init + jnp.log((count + pb_c_base + 1.) / pb_c_base)
-    # print(children_values)
-    # children_values = qtransform(tree, parent)
-    children_values = tree.children_values[parent]
+    
     policy_weights = action_selection.compute_pikl_puct_weights(
-      children_values, prior_probs, count, tree.num_actions, pb_c)
-    # policy_weights = jnp.where(tree.children_visits[parent] > 0, policy_weights, jnp.zeros_like(policy_weights, dtype=jnp.float32))
-    # policy_weights = policy_weights / (jnp.sum(policy_weights, axis=-1) + 1e-6)
+      qtransform(tree, parent), prior_probs, count + 1, tree.num_actions, pb_c)
+    visit_counts = tree.children_visits[parent]
+    # policy_weights = prior_probs
+    # policy_weights = visit_counts
+    # policy_weights = jnp.where(visit_counts > 0, 1.0, 0.0)
+    policy_weights = jnp.where(visit_counts > 0, policy_weights, jnp.zeros_like(policy_weights))
+    # policy_weights = policy_weights / jnp.where(visit_counts> 0, jnp.sum(policy_weights, axis=-1), 1.0)
+  
     # jax.debug.print("policy_weights {policy_weights}", policy_weights=policy_weights)
-
-    parent_value = count * jnp.dot(policy_weights,  \
-      tree.children_rewards[parent] + tree.children_discounts[parent] * children_values) / (count + 1) \
-      + tree.raw_values[parent]  / (count + 1)
+    qvalues = tree.qvalues(parent)
+    # weighted_q = jnp.dot(policy_weights, tree.qvalues(parent))
+    sum_probs = jnp.sum(policy_weights, axis=-1)
+    policy_weights = policy_weights / (sum_probs + 1e-6)
+    weighted_q = jnp.sum(jnp.where(
+      visit_counts > 0,
+      policy_weights * qvalues,
+      0.0), axis=-1)
+    parent_value = count * weighted_q / (count + 1.0) \
+      + tree.raw_values[parent]  / (count + 1.0)
+    # parent_value = count * jnp.dot(policy_weights, tree.qvalues(parent)) / (count + 1.0) \
+    #   + tree.raw_values[parent]  / (count + 1.0)
+    # jax.debug.print("parent_value {parent_value}", parent_value=parent_value)
+    # parent_value = count * jnp.dot(policy_weights,  \
+    #   tree.children_rewards[parent] + tree.children_discounts[parent] * children_values) / (count + 1) \
+    #   + tree.raw_values[parent]  / (count + 1)
 
 
     tree = tree.replace(
         node_values=update(tree.node_values, parent_value, parent),
         node_visits=update(tree.node_visits, count + 1, parent),
-        # children_values=update(
-        #     tree.children_values, children_values, parent, action),
-        # children_visits=update(
-        #     tree.children_visits, children_counts, parent, action)
-            )
+        )
 
     return tree, leaf_value, parent
 
