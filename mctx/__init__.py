@@ -23,7 +23,9 @@ from mctx._src.action_selection import pikl_action_selection
 from mctx._src.action_selection import delta_pikl_action_selection
 from mctx._src.action_selection import delta_pikl_action_sampling_parallel
 from mctx._src.action_selection import delta_pikl_puct_action_sampling_parallel
+from mctx._src.action_selection import delta_pikl_puct_action_sampling
 from mctx._src.action_selection import maximum_entropy_action_selection
+from mctx._src.action_selection import gumbel_muzero_pikl_root_action_selection
 from mctx._src.base import ChanceRecurrentFnOutput
 from mctx._src.base import DecisionRecurrentFnOutput
 from mctx._src.base import InteriorActionSelectionFn
@@ -45,10 +47,12 @@ from mctx._src.policies import parallel_pimct_policy
 from mctx._src.policies import sprites_policy
 from mctx._src.policies import sprites_muzero_policy
 from mctx._src.policies import sprites_gumbel_muzero_policy
+from mctx._src.policies import sprites_gumbel_muzero_policy_baseline
 from mctx._src.policies import stochastic_muzero_policy
 from mctx._src.qtransforms import qtransform_by_min_max
 from mctx._src.qtransforms import qtransform_by_parent_and_siblings
 from mctx._src.qtransforms import qtransform_completed_by_mix_value
+from mctx._src.qtransforms import qtransform_completed_by_mix_value_interior
 from mctx._src.search import search
 from mctx._src.search import sprites_search
 from mctx._src.tree import Tree

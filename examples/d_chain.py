@@ -1,3 +1,6 @@
+import os
+
+os.environ['CUDA_VISIBLE_DEVICES'] = '0,1'
 import functools
 from typing import Tuple
 
@@ -25,6 +28,7 @@ def env_reset(start,  depth, num_actions):
     print(reward_map)
     end = [[1, i - 1] for i in range(depth, 0, -1)] + [[0, depth]]
     print(end)
+    print(jax.nn.softmax(jnp.ones(num_actions)))
     return Env(
         state = jnp.array(start),
         end_state = jnp.array(end),
@@ -113,24 +117,32 @@ def recurrent_fn(params, rng_key, action, embedding):
     return recurrent_fn_output, env
 
 available_devices = jax.devices()
-@functools.partial(jax.jit, static_argnums=(2,), device=available_devices[3])
+@functools.partial(jax.jit, static_argnums=(2,))
 def run_mcts(rng_key: chex.PRNGKey, env: Env, num_simulations: int) -> chex.Array:
-    batch_size = 32
+    batch_size = 1024
     # jax.debug.print("{info}", info=env.depth)
     key1, key2 = jax.random.split(rng_key)
     # policy_output = mctx.gumbel_muzero_policy(
-    policy_output = mctx.sprites_policy(
+    # policy_output = mctx.muzero_policy(
+    # policy_output = mctx.sprites_muzero_policy(
+    # policy_output = mctx.sprites_gumbel_muzero_policy_baseline(
+    policy_output = mctx.sprites_gumbel_muzero_policy(
     # policy_output = mctx.parallel_pimct_policy(
         params=None,
         rng_key=key1,
         root=jax.vmap(root_fn, (None, 0), 0)(env, jax.random.split(key2, batch_size)),
         recurrent_fn=jax.vmap(recurrent_fn, (None, 0, 0, 0)),
         num_simulations=num_simulations,
-        max_depth=env.depth + 1,
-        qtransform=functools.partial(mctx.qtransform_by_min_max, min_value=0, max_value=1),
-        dirichlet_fraction=0.0,
+        max_depth=env.depth,
+        # qtransform=mctx.qtransform_by_parent_and_siblings,
+        # qtransform=functools.partial(mctx.qtransform_by_min_max, min_value=0, max_value=1),
+        qtransform=functools.partial(mctx.qtransform_completed_by_mix_value,
+                                    rescale_values=False, 
+                                     ),
+        # dirichlet_fraction=0.0,
         # c_param=1.414,
-        num_samples=10,
+        # pb_c_init = 1.414,
+        # num_samples=1, 
     )
     return policy_output
 
@@ -143,8 +155,13 @@ env = env_reset(
 
 policy_output = run_mcts(jax.random.PRNGKey(0), env, 1000)
 # print(policy_output.search_tree.summary().qvalues)
+# print(policy_output.search_tree.children_rewards[:, 0, :].mean(axis=0))
+# print(policy_output.search_tree.children_discounts[:, 0, :].mean(axis=0))
+# print(policy_output.search_tree.children_values[:, 0, :].mean(axis=0))
 print(policy_output.search_tree.summary().qvalues.mean(axis=0))
 print(policy_output.search_tree.summary().qvalues.max(axis=0))
 print(policy_output.search_tree.summary().qvalues.min(axis=0))
-print(policy_output.search_tree.summary().visit_counts.mean(axis=0))
+print(policy_output.search_tree.summary().value.mean(axis=0))
+print(policy_output.search_tree.summary().value.max(axis=0))
+print(policy_output.search_tree.summary().value.min(axis=0))
 print(policy_output.action_weights.mean(axis=0))

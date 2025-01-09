@@ -113,7 +113,8 @@ def uct_action_selection(
 
 @jax.jit
 def compute_pikl_puct_weights(q, prior_logits, visits, num_children, c_param):
-    lambda_N = c_param * jnp.sqrt(visits) / (visits + 1e-4) 
+    # lambda_N = c_param  / jnp.sqrt(visits + 1e-4) 
+    lambda_N = c_param  * jnp.sqrt(visits) / (visits + 1.0) 
     alpha_min = jnp.max(q + lambda_N * prior_logits)
     alpha_max = jnp.max(q + lambda_N)    
 
@@ -139,7 +140,12 @@ def compute_pikl_puct_weights(q, prior_logits, visits, num_children, c_param):
                 lambda _: jnp.sum(jax.lax.while_loop(cond_fn, body_fn, init_val)) / 2,
                 operand=None)
     
-    return lambda_N * prior_logits / (alpha - q)
+    # jax.debug.print("lambda_N {a}, prior logit
+    # s {b}, q {d}, alpha - q {c}", a=lambda_N, b=prior_logits, d = q,c=alpha - q)
+    
+    policy_output = lambda_N * prior_logits / (alpha - q)
+    normalized_policy_output = policy_output / jnp.sum(policy_output, axis=-1, keepdims=True)
+    return normalized_policy_output
 
 @jax.jit
 def compute_pikl_weights(q, visits, num_children, c_param, uniform=None):
@@ -246,6 +252,56 @@ def count_elements(input_array):
     unique_count = jnp.array([jnp.sum(input_array == val) for val in input_array])
     return unique_count
 
+
+def delta_pikl_puct_action_sampling(
+    rng_key: chex.PRNGKey,
+    tree: tree_lib.Tree,
+    node_index: chex.Numeric,
+    depth: chex.Numeric,
+    *,
+    pb_c_init: float = 1.25,
+    pb_c_base: float = 19652.0,
+    qtransform: base.QTransform = qtransforms.qtransform_completed_by_mix_value_interior,
+) -> chex.Array:
+  """Returns the action selected for a node index.
+
+  Args:
+    rng_key: random number generator state.
+    tree: _unbatched_ MCTS tree state.
+    node_index: scalar index of the node from which to select an action.
+    depth: the scalar depth of the current node. The root has depth zero.
+    pb_c_init: constant c_1 in the PUCT formula.
+    pb_c_base: constant c_2 in the PUCT formula.
+    qtransform: a monotonic transformation to convert the Q-values to [0, 1].
+
+  Returns:
+    action: the action selected from the given node.
+  """
+  del rng_key
+  visit_counts = tree.children_visits[node_index]
+  node_visit = tree.node_visits[node_index]
+  # pb_c = pb_c_init + jnp.log((node_visit + pb_c_base + 1.) / pb_c_base)
+  # UCT action selection
+  pb_c = pb_c_init + jnp.log((node_visit + pb_c_base + 1.) / pb_c_base)
+  # policy_score = c_param * jnp.sqrt(jnp.log(node_visit + 1) / (visit_counts + 1e-4))
+  # jax.debug.print("node_index shape {info}", info=node_index.shape)
+  prior_logits = tree.children_prior_logits[node_index]
+  # jax.debug.print("prior logits shape {info}", info=prior_logits.shape)
+  prior_probs = jax.nn.softmax(prior_logits)
+  # num_samples = visit_counts.shape[0]
+  # values = qtransform(tree, node_index)
+  # jax.debug.print("qvalues {info}", info=tree.qvalues(node_index))
+  values = qtransform(tree, node_index)
+  policy_weights = compute_pikl_puct_weights(values, prior_probs, 
+            node_visit, tree.num_actions, pb_c)
+  # node_noise_score = 1e-7 * jax.random.uniform(
+  #     rng_key, (tree.num_actions,))
+  to_argmax = _prepare_argmax_input(
+      policy_weights, visit_counts) 
+  # + node_noise_score
+  to_return = masked_argmax(to_argmax, tree.root_invalid_actions * (depth == 0)) 
+  return to_return
+
 def delta_pikl_puct_action_sampling_parallel(
     rng_key: chex.PRNGKey,
     tree: tree_lib.Tree,
@@ -255,7 +311,8 @@ def delta_pikl_puct_action_sampling_parallel(
     pb_c_init: float = 1.25,
     pb_c_base: float = 19652.0,
     num_samples: int = 1,
-    qtransform: base.QTransform = qtransforms.qtransform_by_parent_and_siblings,
+    fraction: float = 1.0,
+    qtransform: base.QTransform = qtransforms.qtransform_completed_by_mix_value_interior,
 ) -> chex.Array:
   """Returns the action selected for a node index.
 
@@ -283,27 +340,28 @@ def delta_pikl_puct_action_sampling_parallel(
   prior_probs = jax.nn.softmax(prior_logits)
   num_samples = visit_counts.shape[0]
   values = jax.vmap(qtransform, in_axes=[None, 0])(tree, node_index)
-  policy_weights = jax.vmap(compute_pikl_puct_weights, in_axes=[0, 0, 0, None, 0,])(values, prior_probs, 
-            node_visit + 1, tree.num_actions, pb_c)
+  policy_weights = jax.vmap(compute_pikl_puct_weights, in_axes=[0, 0, 0, None, 0,])(
+    values, prior_probs, node_visit + 1, tree.num_actions, pb_c)
+  # policy_weights = compute_pikl_puct_weights(values, prior_probs, 
+  #           node_visit + 1, tree.num_actions, pb_c)
 
-  # jax.debug.print("policy weights shape {info}", info=policy_weights.shape)
-  # to_sample =  policy_weights
-  unique_count = count_elements(node_index) 
-  adjust_probs = sample_point_distribution(policy_weights, node_visit - 1, visit_counts, unique_count)
-  # to_sample = policy_weights
-  to_sample = adjust_probs
-  # node_noise_score = 1e-7 * jax.vmap(jax.random.uniform, in_axes=(0, None))(
-  #     rng_key, (tree.num_actions,))
-  # to_sample = policy_weights + node_noise_score
-  # to_sample = policy_weights 
-  # to_sample = 0.5 * adjust_probs + 0.5 * policy_weights  #+ node_noise_score
+  gumbel = jax.random.gumbel(rng_key, policy_weights.shape)
+  def _get_logits_from_probs(probs):
+    tiny = jnp.finfo(probs.dtype).tiny
+    return jnp.log(jnp.maximum(probs, tiny))
+  policy_weights = jax.nn.softmax(
+     _get_logits_from_probs(policy_weights) + gumbel)
+
+  to_argmax = jax.vmap(_prepare_argmax_input)(
+      policy_weights, visit_counts)
   invalid_actions_root = jnp.repeat(tree.root_invalid_actions[None, :], num_samples, axis=0)
   # mask = jnp.where(depth == 0, invalid_actions_root, jnp.zeros_like(invalid_actions_root))
   mask = invalid_actions_root * jnp.repeat((depth == 0)[:, None], tree.num_actions, axis=1)
   # to_sample = _get_logits_from_probs(to_sample)
 
   # return masked_sample(rng_key, to_sample, mask)
-  return jax.vmap(masked_choice, in_axes=[0, 0, None, 0])(rng_key, to_sample, tree.num_actions, mask)
+  return jax.vmap(masked_argmax)(to_argmax, mask) 
+  # return jax.vmap(masked_choice, in_axes=[0, 0, None, 0])(rng_key, to_sample, tree.num_actions, mask)
 
 def delta_pikl_action_sampling_parallel(
     rng_key: chex.PRNGKey,
@@ -313,6 +371,7 @@ def delta_pikl_action_sampling_parallel(
     *,
     c_param: float = 1.414,
     num_samples: int = 1,
+    fraction: float = 0.7,
     qtransform: base.QTransform = qtransforms.qtransform_by_parent_and_siblings,
 ) -> chex.Array:
   """Returns the action selected for a node index.
@@ -337,14 +396,14 @@ def delta_pikl_action_sampling_parallel(
   num_samples = visit_counts.shape[0]
   values = jax.vmap(qtransform, in_axes=[None, 0])(tree, node_index)
   policy_weights = jax.vmap(compute_pikl_weights, in_axes=[0, 0, None, None, 0])(values, 
-            node_visit, tree.num_actions, c_param, jnp.ones_like(visit_counts) / len(visit_counts))
+            node_visit + 1, tree.num_actions, c_param, jnp.ones_like(visit_counts) / len(visit_counts))
   # jax.debug.print("policy weights shape {info}", info=policy_weights.shape)
   # to_sample =  policy_weights
-  # unique_counts = count_elements(node_index)
-  # adjust_probs = sample_point_distribution(policy_weights, node_visit, visit_counts, unique_counts)
-  to_sample = policy_weights
+  unique_counts = count_elements(node_index)
+  adjust_probs = sample_point_distribution(policy_weights, node_visit, visit_counts, unique_counts)
+  # to_sample = policy_weights
   # to_sample = adjust_probs
-  # to_sample =  0.5 * adjust_probs + 0.5 * policy_weights
+  to_sample =  fraction * adjust_probs + (1-fraction) * policy_weights
   # jax.debug.print("rng_key shape {info}", info=rng_key.shape)  
   invalid_actions_root = jnp.repeat(tree.root_invalid_actions[None, :], num_samples, axis=0)
   # mask = jnp.where(depth == 0, invalid_actions_root, jnp.zeros_like(invalid_actions_root))
@@ -486,6 +545,70 @@ GumbelMuZeroExtraDataType = TypeVar(  # pylint: disable=invalid-name
     "GumbelMuZeroExtraDataType", bound=GumbelMuZeroExtraData)
 
 
+def _get_logits_from_probs(probs):
+  tiny = jnp.finfo(probs.dtype).tiny
+  return jnp.log(jnp.maximum(probs, tiny))
+
+def gumbel_muzero_pikl_root_action_selection(
+    rng_key: chex.PRNGKey,
+    tree: tree_lib.Tree[GumbelMuZeroExtraDataType],
+    node_index: chex.Numeric,
+    *,
+    num_simulations: chex.Numeric,
+    max_num_considered_actions: chex.Numeric,
+    qtransform: base.QTransform = qtransforms.qtransform_completed_by_mix_value_interior,
+) -> chex.Array:
+  """Returns the action selected by Sequential Halving with Gumbel.
+
+  Initially, we sample `max_num_considered_actions` actions without replacement.
+  From these, the actions with the highest `gumbel + logits + qvalues` are
+  visited first.
+
+  Args:
+    rng_key: random number generator state.
+    tree: _unbatched_ MCTS tree state.
+    node_index: scalar index of the node from which to take an action.
+    num_simulations: the simulation budget.
+    max_num_considered_actions: the number of actions sampled without
+      replacement.
+    qtransform: a monotonic transformation for the Q-values.
+
+  Returns:
+    action: the action selected from the given node.
+  """
+  del rng_key
+  chex.assert_shape([node_index], ())
+  visit_counts = tree.children_visits[node_index]
+  prior_logits = tree.children_prior_logits[node_index]
+  pb_c = 1.25 + jnp.log((tree.node_visits[node_index] + 19652.0 + 1.) / 19652.0)
+  policy_weights = compute_pikl_puct_weights(
+      qtransform(tree, node_index), prior_logits, visit_counts, tree.num_actions, pb_c)
+  prior_logits = _get_logits_from_probs(policy_weights)
+  chex.assert_equal_shape([visit_counts, prior_logits])
+
+  table = jnp.array(seq_halving.get_table_of_considered_visits(
+      max_num_considered_actions, num_simulations))
+  num_valid_actions = jnp.sum(
+      1 - tree.root_invalid_actions, axis=-1).astype(jnp.int32)
+  num_considered = jnp.minimum(
+      max_num_considered_actions, num_valid_actions)
+  chex.assert_shape(num_considered, ())
+  # At the root, the simulation_index is equal to the sum of visit counts.
+  simulation_index = jnp.sum(visit_counts, -1)
+  chex.assert_shape(simulation_index, ())
+  considered_visit = table[num_considered, simulation_index]
+  chex.assert_shape(considered_visit, ())
+  gumbel = tree.extra_data.root_gumbel
+  to_argmax = seq_halving.score_considered_pikl(
+      considered_visit, gumbel, prior_logits,
+      visit_counts)
+
+  # Masking the invalid actions at the root.
+  return masked_argmax(to_argmax, tree.root_invalid_actions)
+
+
+
+
 def gumbel_muzero_root_action_selection(
     rng_key: chex.PRNGKey,
     tree: tree_lib.Tree[GumbelMuZeroExtraDataType],
@@ -536,7 +659,7 @@ def gumbel_muzero_root_action_selection(
   to_argmax = seq_halving.score_considered(
       considered_visit, gumbel, prior_logits, completed_qvalues,
       visit_counts)
-
+  # jax.debug.print("running root")
   # Masking the invalid actions at the root.
   return masked_argmax(to_argmax, tree.root_invalid_actions)
 

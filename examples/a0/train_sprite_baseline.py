@@ -15,7 +15,7 @@
 import datetime
 import os
 
-os.environ['CUDA_VISIBLE_DEVICES'] = '0,1'
+os.environ['CUDA_VISIBLE_DEVICES'] = '2,3'
 import pickle
 import time
 from functools import partial
@@ -43,7 +43,7 @@ num_devices = len(devices)
 
 class Config(BaseModel):
     env_id: pgx.EnvId = "go_9x9"
-    seed: int = 42
+    seed: int = 0
     max_num_iters: int = 400
     # network params
     num_channels: int = 128
@@ -51,15 +51,18 @@ class Config(BaseModel):
     resnet_v2: bool = True
     # selfplay params
     selfplay_batch_size: int = 1024
-    num_simulations: int = 200
-    num_samples: int = 1
-    max_num_steps: int = 128
+    num_simulations: int = 32
+    num_samples: int = 4
+    max_num_steps: int = 256
+    temperature: float = 1.0
+    fraction: float = 1.0
     # training params
     training_batch_size: int = 4096
     learning_rate: float = 0.001
     # eval params
-    eval_interval: int = 5
-
+    eval_interval: int = 10
+    eval_simulation: int = 200
+    eval_baseline_simulation: int = 32
     class Config:
         extra = "forbid"
 
@@ -79,6 +82,11 @@ env = pgx.make(config.env_id)
 #     )
 
 
+ckpt = "baseline/000200.ckpt"
+with open(ckpt, "rb") as f:
+    dic = pickle.load(f)
+    baseline = dic["model"]
+    baseline_model = {'params': baseline['params'], 'batch_stats': baseline['batch_stats']}
     # baseline_model = jax.device_put_replicated(baseline_model, devices)
 
 # def forward_fn(x, is_training=True):
@@ -141,8 +149,8 @@ class SelfplayOutput(NamedTuple):
     discount: jnp.ndarray
 
 
-@jax.pmap
-def selfplay(model, rng_key: jnp.ndarray) -> SelfplayOutput:
+@partial(jax.pmap, in_axes=(0, 0, None))
+def selfplay(model, rng_key: jnp.ndarray, temperature=1.0) -> SelfplayOutput:
     if isinstance(model, tuple):
         model_params, model_state = model
     elif isinstance(model, dict):
@@ -161,29 +169,20 @@ def selfplay(model, rng_key: jnp.ndarray) -> SelfplayOutput:
             state.observation, is_training=False
         )
         root = mctx.RootFnOutput(prior_logits=logits, value=value, embedding=state)
-        # if config.num_samples == 1:
-        #     policy_output = mctx.sprites_muzero_policy(
-        #         params={'params': model_params, 'batch_stats': model_state},
-        #         rng_key=key1,
-        #         root=root,
-        #         recurrent_fn=recurrent_fn,
-        #         num_simulations=config.num_simulations,
-        #         invalid_actions=~state.legal_action_mask,
-        #         qtransform=mctx.qtransform_completed_by_mix_value,
-        #         # gumbel_scale=1.0,
-        #     )
-        # else:
-        policy_output = mctx.sprites_policy(
+        policy_output = mctx.sprites_gumbel_muzero_policy_baseline(
             params={'params': model_params, 'batch_stats': model_state},
             rng_key=key1,
             root=root,
             recurrent_fn=recurrent_fn,
             num_simulations=config.num_simulations,
-            num_samples=1.0, 
+            # num_samples=config.num_samples, 
             invalid_actions=~state.legal_action_mask,
-            qtransform=mctx.qtransform_by_parent_and_siblings,
-            temperature=1.0,
+            # qtransform=mctx.qtransform_by_parent_and_siblings,
+            qtransform=mctx.qtransform_completed_by_mix_value,
             # gumbel_scale=1.0,
+            # dirichlet_fraction= 0.0, 
+            # fraction=config.fraction,
+            # temperature=temperature,
         )
         actor = state.current_player
         keys = jax.random.split(key2, batch_size)
@@ -253,10 +252,13 @@ def loss_fn(model_params, model_state, samples: Sample):
     policy_loss = optax.softmax_cross_entropy(logits, samples.policy_tgt)
     policy_loss = jnp.mean(policy_loss)
 
+    l2_loss = optax.l2_loss(logits)
+    l2_loss = jnp.mean(l2_loss)
+
     value_loss = optax.l2_loss(value, samples.value_tgt)
     value_loss = jnp.mean(value_loss * samples.mask)  # mask if the episode is truncated
 
-    return policy_loss + value_loss, (model_state['batch_stats'], policy_loss, value_loss)
+    return policy_loss + value_loss , (model_state['batch_stats'], policy_loss, value_loss, l2_loss)
 
 
 @partial(jax.pmap, axis_name="i")
@@ -267,23 +269,22 @@ def train(model, opt_state, data: Sample):
         model_params, model_state = model['params'], model['batch_stats']
     else:
         raise ValueError("model should be a tuple or a dict, but got {}".format(type(model)))
-    grads, (model_state, policy_loss, value_loss) = jax.grad(loss_fn, has_aux=True)(
+    grads, (model_state, policy_loss, value_loss, l2_loss) = jax.grad(loss_fn, has_aux=True)(
         model_params, model_state, data
     )
     grads = jax.lax.pmean(grads, axis_name="i")
     updates, opt_state = optimizer.update(grads, opt_state)
     model_params = optax.apply_updates(model_params, updates)
     model = {'params': model_params, 'batch_stats': model_state}
-    return model, opt_state, policy_loss, value_loss
+    return model, opt_state, policy_loss, value_loss, l2_loss
 
 
 @jax.pmap
-def evaluate(rng_key, baseline_model, my_model):
-
+def evaluate(rng_key, my_model):
     """A simplified evaluation by sampling. Only for debugging. 
     Please use MCTS and run tournaments for serious evaluation."""
     my_player = 0
-    # my_model_params, my_model_state = my_model['params'], my_model['batch_stats']
+    my_model_params, my_model_state = my_model['params'], my_model['batch_stats']
 
     key, subkey = jax.random.split(rng_key)
     batch_size = config.selfplay_batch_size // num_devices
@@ -292,78 +293,57 @@ def evaluate(rng_key, baseline_model, my_model):
 
     def body_fn(val):
         key, state, R = val
+        my_logits, my_value= forward.apply(
+            # my_model_params, my_model_state, 
+            {'params': my_model_params, 'batch_stats': my_model_state},
+            state.observation, is_training=False
+        )
+
+        key1, key = jax.random.split(key)
+        root = mctx.RootFnOutput(prior_logits=my_logits, value=my_value, embedding=state)
+
+        my_output = mctx.sprites_gumbel_muzero_policy_baseline(
+            params={'params': my_model_params, 'batch_stats': my_model_state},
+            rng_key=key1,
+            root=root,
+            recurrent_fn=recurrent_fn,
+            num_simulations=config.eval_simulation,
+            # num_samples=1, 
+            # dirichlet_fraction=0.0,
+            invalid_actions=~state.legal_action_mask,
+            qtransform=mctx.qtransform_completed_by_mix_value,
+            # fraction=config.fraction,
+            gumbel_scale=1.0,
+        )
+
         opp_logits, opp_value = forward.apply(
             # my_model_params, my_model_state, 
-            baseline_model,
-            # {'params': baseline_model['params'], 'batch_stats': baseline_model['batch_stats']},
+            {'params': baseline_model['params'], 'batch_stats': baseline_model['batch_stats']},
             state.observation, is_training=False
         )
         # opp_logits, _ = baseline(state.observation)
-        key, subkey = jax.random.split(key)
+        # key, subkey = jax.random.split(key)
         # greedy_action = jax.random.categorical(subkey, opp_logits, axis=-1)
         root = mctx.RootFnOutput(prior_logits=opp_logits, value=opp_value, embedding=state)
 
-        key, key1 = jax.random.split(key)
-        # base_output = mctx.muzero_policy(
+        key1, key = jax.random.split(key)
         base_output = mctx.gumbel_muzero_policy(
-        # base_output = mctx.sprites_gumbel_muzero_policy_baseline(
-            # params={'params': baseline_model['params'], 'batch_stats': baseline_model['batch_stats']},
-            params = baseline_model,
+            params={'params': baseline_model['params'], 'batch_stats': baseline_model['batch_stats']},
             rng_key=key1,
             root=root,
-            # dirichlet_fraction = 0.0,
             recurrent_fn=recurrent_fn,
-            num_simulations=config.num_simulations,
-            invalid_actions=~state.legal_action_mask,
-            # qtransform=mctx.qtransform_by_parent_and_siblings,
-            # qtransform=partial(mctx.qtransform_completed_by_mix_value, maxvisit_init=100, value_scale=0.1),
-            qtransform=mctx.qtransform_completed_by_mix_value,
-            # qtransform=partial(mctx.qtransform_by_min_max, min_value=0, max_value=1),
-            gumbel_scale=1.0,
-            # temperature=0.2,
-        )
-        my_logits, my_value= forward.apply(
-            # baseline_model,
-            my_model,
-            state.observation, is_training=False
-        )
-
-        key, key2 = jax.random.split(key)
-        root2 = mctx.RootFnOutput(prior_logits=my_logits, value=my_value, embedding=state)
-
-        # my_output = mctx.gumbel_muzero_policy(
-        # my_output = mctx.muzero_policy(
-        # my_output = mctx.sprites_gumbel_muzero_policy_baseline(
-        my_output = mctx.sprites_gumbel_muzero_policy(
-        # my_output = mctx.sprites_policy(
-        # my_output = mctx.sprites_muzero_policy(
-            # params={'params': my_model_params, 'batch_stats': my_model_state},
-            # params={'params': baseline_model['params'], \
-            #         'batch_stats': baseline_model['batch_stats']},
-            # params = baseline_model,
-            # params = baseline_model,
-            params=my_model,
-            rng_key=key2,
-            root=root2,
-            recurrent_fn=recurrent_fn,
-            # num_simulations=config.num_simulations,
-            num_simulations=config.num_simulations,
-            # dirichlet_fraction = 0.0,
-            # num_samples=config.num_samples, 
+            num_simulations=config.eval_baseline_simulation,
             invalid_actions=~state.legal_action_mask,
             qtransform=mctx.qtransform_completed_by_mix_value,
-            # qtransform=mctx.qtransform_by_parent_and_siblings,
-            # qtransform=partial(mctx.qtransform_by_min_max, min_value=0, max_value=1),
             gumbel_scale=1.0,
         )
 
-        # is_my_turn = (state.current_player == my_player).reshape((-1, 1))
-        is_my_turn = (state.current_player == my_player)
+
+        is_my_turn = (state.current_player == my_player) # .reshape((-1, 1))
         # action = jnp.where(is_my_turn, my_output.action, greedy_action, )
         # logits = jnp.where(is_my_turn, my_logits, opp_logits)
         # action = jax.random.categorical(subkey, logits, axis=-1)
         action = jnp.where(is_my_turn, my_output.action, base_output.action, )
-        # action = jnp.where(is_my_turn, my_output.action, greedy_action, )
         # print(action.shape)
         subkey, key = jax.random.split(key)
         subkeys = jax.random.split(subkey, batch_size)
@@ -378,53 +358,120 @@ def evaluate(rng_key, baseline_model, my_model):
 
 
 if __name__ == "__main__":
+    wandb.init(project="pgx-az", name='sprite baseline',\
+            config=config.model_dump())
 
     # Initialize model and opt_state
     dummy_state = jax.vmap(env.init)(jax.random.split(jax.random.PRNGKey(0), 2))
     dummy_input = dummy_state.observation
-    # ckpt = "checkpoints/go_9x9_20241208173621/000200.ckpt"
-    ckpt = "baseline/000400.ckpt"
-    with open(ckpt, "rb") as f:
-        dic = pickle.load(f)
-        baseline = dic["model"]
-        baseline_model = {'params': baseline['params'], 'batch_stats': baseline['batch_stats']}
-    # model = forward.init(jax.random.PRNGKey(0), dummy_input, 
-    #                       is_training=False)  # (params, state)
-    # params = model['params']
-    # # replicates to all devices
-    model = jax.device_put_replicated((baseline_model), devices)
+    model = forward.init(jax.random.PRNGKey(0), dummy_input, 
+                          is_training=False)  # (params, state)
+    params = model['params']
+    opt_state = optimizer.init(params=params)
+    # replicates to all devices
+    model, opt_state = jax.device_put_replicated((model, opt_state), devices)
 
-    # myckpt = f"./checkpoints/hybrid_muzero/000400.ckpt" # sprite baseline
-    myckpt = f"./checkpoints/go_9x9_20241216152354/000400.ckpt" # sprite method
-    # myckpt = "./checkpoints/go_9x9_20241217235502_sprites_seed_42/000400.ckpt"
-    with open(myckpt, "rb") as f:
-        dic = pickle.load(f)
-        mine = dic["model"]
-        my_model = {'params': mine['params'], 'batch_stats': mine['batch_stats']}
-    # model = forward.init(jax.random.PRNGKey(0), dummy_input, 
-    #                       is_training=False)  # (params, state)
-    # params = model['params']
-    # # replicates to all devices
-    my_model = jax.device_put_replicated((my_model), devices)
+    # Prepare checkpoint dir
+    now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9)))
+    now = now.strftime("%Y%m%d%H%M%S")
+    ckpt_dir = os.path.join("checkpoints", f"{config.env_id}_{now}")
+    os.makedirs(ckpt_dir, exist_ok=True)
 
-    log = {}
+    # Initialize logging dict
+    iteration: int = 0
+    hours: float = 0.0
+    frames: int = 0
+    log = {"iteration": iteration, "hours": hours, "frames": frames}
+    temperature = config.temperature
+    # num_samples = config.num_samples
 
     rng_key = jax.random.PRNGKey(config.seed)
+    while True:
+        # if iteration % 133 == 132:
+        #     temperature = temperature / 3
+            # num_samples = max(num_samples // 4, 1)
 
-        # Evaluation
-    rng_key, subkey = jax.random.split(rng_key)
-    keys = jax.random.split(subkey, num_devices)
-    R = evaluate(keys, model, my_model)
-    log.update(
-        {
-            f"eval/vs_baseline/avg_R": R.mean().item(),
-            f"eval/vs_baseline/win_rate": ((R == 1).sum() / R.size).item(),
-            f"eval/vs_baseline/draw_rate": ((R == 0).sum() / R.size).item(),
-            f"eval/vs_baseline/lose_rate": ((R == -1).sum() / R.size).item(),
-        }
-    )
+        if iteration % config.eval_interval == 0:
+            # Evaluation
+            rng_key, subkey = jax.random.split(rng_key)
+            keys = jax.random.split(subkey, num_devices)
+            R = evaluate(keys, model)
+            win_rate = ((R == 1).sum() / R.size).item()
+            log.update(
+                {
+                    f"eval/vs_baseline/avg_R": R.mean().item(),
+                    f"eval/vs_baseline/win_rate": win_rate,
+                    f"eval/vs_baseline/Elo": 1000 + 400 * jnp.log10(win_rate / (1 - win_rate)).item(),
+                    f"eval/vs_baseline/draw_rate": ((R == 0).sum() / R.size).item(),
+                    f"eval/vs_baseline/lose_rate": ((R == -1).sum() / R.size).item(),
+                }
+            )
 
-    
+            # Store checkpoints
+            model_0, opt_state_0 = jax.tree_util.tree_map(lambda x: x[0], (model, opt_state))
+            with open(os.path.join(ckpt_dir, f"{iteration:06d}.ckpt"), "wb") as f:
+                dic = {
+                    "config": config,
+                    "rng_key": rng_key,
+                    "model": jax.device_get(model_0),
+                    "opt_state": jax.device_get(opt_state_0),
+                    "iteration": iteration,
+                    "frames": frames,
+                    "hours": hours,
+                    "pgx.__version__": pgx.__version__,
+                    "env_id": env.id,
+                    "env_version": env.version,
+                }
+                pickle.dump(dic, f)
 
-    print(log)
-        
+        print(log)
+        wandb.log(log)
+
+        if iteration >= config.max_num_iters:
+            break
+
+        iteration += 1
+        log = {"iteration": iteration}
+        st = time.time()
+
+        # Selfplay
+        rng_key, subkey = jax.random.split(rng_key)
+        keys = jax.random.split(subkey, num_devices)
+        data: SelfplayOutput = selfplay(model, keys, temperature)
+        samples: Sample = compute_loss_input(data)
+
+        # Shuffle samples and make minibatches
+        samples = jax.device_get(samples)  # (#devices, batch, max_num_steps, ...)
+        frames += samples.obs.shape[0] * samples.obs.shape[1] * samples.obs.shape[2]
+        samples = jax.tree_util.tree_map(lambda x: x.reshape((-1, *x.shape[3:])), samples)
+        rng_key, subkey = jax.random.split(rng_key)
+        ixs = jax.random.permutation(subkey, jnp.arange(samples.obs.shape[0]))
+        samples = jax.tree_util.tree_map(lambda x: x[ixs], samples)  # shuffle
+        num_updates = samples.obs.shape[0] // config.training_batch_size
+        minibatches = jax.tree_util.tree_map(
+            lambda x: x.reshape((num_updates, num_devices, -1) + x.shape[1:]), samples
+        )
+
+        # Training
+        policy_losses, value_losses, l2_losses = [], [], []
+        for i in range(num_updates):
+            minibatch: Sample = jax.tree_util.tree_map(lambda x: x[i], minibatches)
+            model, opt_state, policy_loss, value_loss, l2_loss = train(model, opt_state, minibatch)
+            policy_losses.append(policy_loss.mean().item())
+            value_losses.append(value_loss.mean().item())
+            l2_losses.append(l2_loss.mean().item()) 
+        policy_loss = sum(policy_losses) / len(policy_losses)
+        value_loss = sum(value_losses) / len(value_losses)
+        l2_loss = sum(l2_losses) / len(l2_losses)
+
+        et = time.time()
+        hours += (et - st) / 3600
+        log.update(
+            {
+                "train/policy_loss": policy_loss,
+                "train/value_loss": value_loss,
+                "train/l2_loss": l2_loss,
+                "hours": hours,
+                "frames": frames,
+            }
+        )

@@ -15,7 +15,8 @@
 import datetime
 import os
 
-os.environ['CUDA_VISIBLE_DEVICES'] = '0,1'
+os.environ['CUDA_VISIBLE_DEVICES'] = '2,3'
+import json
 import pickle
 import time
 from functools import partial
@@ -51,7 +52,7 @@ class Config(BaseModel):
     resnet_v2: bool = True
     # selfplay params
     selfplay_batch_size: int = 1024
-    num_simulations: int = 200
+    num_simulations: int = 64
     num_samples: int = 1
     max_num_steps: int = 128
     # training params
@@ -279,7 +280,6 @@ def train(model, opt_state, data: Sample):
 
 @jax.pmap
 def evaluate(rng_key, baseline_model, my_model):
-
     """A simplified evaluation by sampling. Only for debugging. 
     Please use MCTS and run tournaments for serious evaluation."""
     my_player = 0
@@ -299,7 +299,7 @@ def evaluate(rng_key, baseline_model, my_model):
             state.observation, is_training=False
         )
         # opp_logits, _ = baseline(state.observation)
-        key, subkey = jax.random.split(key)
+        # key, subkey = jax.random.split(key)
         # greedy_action = jax.random.categorical(subkey, opp_logits, axis=-1)
         root = mctx.RootFnOutput(prior_logits=opp_logits, value=opp_value, embedding=state)
 
@@ -313,7 +313,7 @@ def evaluate(rng_key, baseline_model, my_model):
             root=root,
             # dirichlet_fraction = 0.0,
             recurrent_fn=recurrent_fn,
-            num_simulations=config.num_simulations,
+            num_simulations=32,
             invalid_actions=~state.legal_action_mask,
             # qtransform=mctx.qtransform_by_parent_and_siblings,
             # qtransform=partial(mctx.qtransform_completed_by_mix_value, maxvisit_init=100, value_scale=0.1),
@@ -323,7 +323,6 @@ def evaluate(rng_key, baseline_model, my_model):
             # temperature=0.2,
         )
         my_logits, my_value= forward.apply(
-            # baseline_model,
             my_model,
             state.observation, is_training=False
         )
@@ -333,7 +332,6 @@ def evaluate(rng_key, baseline_model, my_model):
 
         # my_output = mctx.gumbel_muzero_policy(
         # my_output = mctx.muzero_policy(
-        # my_output = mctx.sprites_gumbel_muzero_policy_baseline(
         my_output = mctx.sprites_gumbel_muzero_policy(
         # my_output = mctx.sprites_policy(
         # my_output = mctx.sprites_muzero_policy(
@@ -341,13 +339,12 @@ def evaluate(rng_key, baseline_model, my_model):
             # params={'params': baseline_model['params'], \
             #         'batch_stats': baseline_model['batch_stats']},
             # params = baseline_model,
-            # params = baseline_model,
-            params=my_model,
+            params = my_model,
             rng_key=key2,
             root=root2,
             recurrent_fn=recurrent_fn,
             # num_simulations=config.num_simulations,
-            num_simulations=config.num_simulations,
+            num_simulations=800,
             # dirichlet_fraction = 0.0,
             # num_samples=config.num_samples, 
             invalid_actions=~state.legal_action_mask,
@@ -378,53 +375,56 @@ def evaluate(rng_key, baseline_model, my_model):
 
 
 if __name__ == "__main__":
-
+    wandb.init(project="pgx-az", name='sprite eval',\
+            config=config.model_dump())
     # Initialize model and opt_state
     dummy_state = jax.vmap(env.init)(jax.random.split(jax.random.PRNGKey(0), 2))
     dummy_input = dummy_state.observation
-    # ckpt = "checkpoints/go_9x9_20241208173621/000200.ckpt"
-    ckpt = "baseline/000400.ckpt"
+    ckpt = "baseline/000200.ckpt"
     with open(ckpt, "rb") as f:
         dic = pickle.load(f)
         baseline = dic["model"]
         baseline_model = {'params': baseline['params'], 'batch_stats': baseline['batch_stats']}
-    # model = forward.init(jax.random.PRNGKey(0), dummy_input, 
-    #                       is_training=False)  # (params, state)
-    # params = model['params']
-    # # replicates to all devices
-    model = jax.device_put_replicated((baseline_model), devices)
 
-    # myckpt = f"./checkpoints/hybrid_muzero/000400.ckpt" # sprite baseline
-    myckpt = f"./checkpoints/go_9x9_20241216152354/000400.ckpt" # sprite method
-    # myckpt = "./checkpoints/go_9x9_20241217235502_sprites_seed_42/000400.ckpt"
-    with open(myckpt, "rb") as f:
-        dic = pickle.load(f)
-        mine = dic["model"]
-        my_model = {'params': mine['params'], 'batch_stats': mine['batch_stats']}
-    # model = forward.init(jax.random.PRNGKey(0), dummy_input, 
-    #                       is_training=False)  # (params, state)
-    # params = model['params']
-    # # replicates to all devices
-    my_model = jax.device_put_replicated((my_model), devices)
-
+    logs = []
     log = {}
+    model = jax.device_put_replicated((baseline_model), devices)
+    for i in range(20, 401, 20):
+        # ckpt = f"./checkpoints/go_9x9_20241216152354/{i:06d}.ckpt" # sprite method
+        ckpt = f"./checkpoints/go_9x9_20241217235502_sprites_seed_42/{i:06d}.ckpt" # sprite method no scale
+        # ckpt = f"./checkpoints/hybrid_muzero/{i:06d}.ckpt" # sprite baseline
 
-    rng_key = jax.random.PRNGKey(config.seed)
+        with open(ckpt, "rb") as f:
+            dic = pickle.load(f)
+            mymodel = dic["model"]
+            my_model = {'params': mymodel['params'], 'batch_stats': mymodel['batch_stats']}
+            # model = forward.init(jax.random.PRNGKey(0), dummy_input, 
+            #                       is_training=False)  # (params, state)
+            # params = model['params']
+            # # replicates to all devices
+        my_model = jax.device_put_replicated((my_model), devices)
 
-        # Evaluation
-    rng_key, subkey = jax.random.split(rng_key)
-    keys = jax.random.split(subkey, num_devices)
-    R = evaluate(keys, model, my_model)
-    log.update(
-        {
-            f"eval/vs_baseline/avg_R": R.mean().item(),
-            f"eval/vs_baseline/win_rate": ((R == 1).sum() / R.size).item(),
-            f"eval/vs_baseline/draw_rate": ((R == 0).sum() / R.size).item(),
-            f"eval/vs_baseline/lose_rate": ((R == -1).sum() / R.size).item(),
-        }
-    )
+        rng_key = jax.random.PRNGKey(config.seed)
 
-    
-
-    print(log)
-        
+            # Evaluation
+        rng_key, subkey = jax.random.split(rng_key)
+        keys = jax.random.split(subkey, num_devices)
+        R = evaluate(keys, model, my_model)
+        win_rate = ((R == 1).sum() / R.size).item()
+        log.update(
+            {
+                f"eval/vs_baseline/avg_R": R.mean().item(),
+                f"eval/vs_baseline/win_rate": win_rate,
+                f"eval/vs_baseline/Elo": 1000 + 400 * jnp.log10(win_rate / (1 - win_rate)).item(),
+                f"eval/vs_baseline/draw_rate": ((R == 0).sum() / R.size).item(),
+                f"eval/vs_baseline/lose_rate": ((R == -1).sum() / R.size).item(),
+            }
+        )
+        logs.append(log.copy()) 
+        wandb.log(log)
+        print(log)
+        del my_model
+        # del model
+        # save log flush
+        with open("eval_log.json", "w") as f:
+            json.dump(logs, f)

@@ -40,7 +40,7 @@ def ments_policy(
     loop_fn: base.LoopFn = jax.lax.fori_loop,
     *,
     qtransform: base.QTransform = qtransforms.qtransform_by_parent_and_siblings,
-    dirichlet_fraction: chex.Numeric = 0.25,
+    dirichlet_fraction: chex.Numeric = 0.0,
     dirichlet_alpha: chex.Numeric = 0.3,
     tau: chex.Numeric = 1e-1,
     epsilon: chex.Numeric = 1e-2,
@@ -138,6 +138,129 @@ def ments_policy(
       action_weights=action_weights,
       search_tree=search_tree)
 
+def sprites_gumbel_muzero_policy_baseline(
+    params: base.Params,
+    rng_key: chex.PRNGKey,
+    root: base.RootFnOutput,
+    recurrent_fn: base.RecurrentFn,
+    num_simulations: int,
+    invalid_actions: Optional[chex.Array] = None,
+    max_depth: Optional[int] = None,
+    loop_fn: base.LoopFn = jax.lax.fori_loop,
+    *,
+    qtransform: base.QTransform = qtransforms.qtransform_completed_by_mix_value,
+    max_num_considered_actions: int = 16,
+    gumbel_scale: chex.Numeric = 1.,
+) -> base.PolicyOutput[action_selection.GumbelMuZeroExtraData]:
+  """Runs Gumbel MuZero search and returns the `PolicyOutput`.
+
+  This policy implements Full Gumbel MuZero from
+  "Policy improvement by planning with Gumbel".
+  https://openreview.net/forum?id=bERaNdoegnO
+
+  At the root of the search tree, actions are selected by Sequential Halving
+  with Gumbel. At non-root nodes (aka interior nodes), actions are selected by
+  the Full Gumbel MuZero deterministic action selection.
+
+  In the shape descriptions, `B` denotes the batch dimension.
+
+  Args:
+    params: params to be forwarded to root and recurrent functions.
+    rng_key: random number generator state, the key is consumed.
+    root: a `(prior_logits, value, embedding)` `RootFnOutput`. The
+      `prior_logits` are from a policy network. The shapes are
+      `([B, num_actions], [B], [B, ...])`, respectively.
+    recurrent_fn: a callable to be called on the leaf nodes and unvisited
+      actions retrieved by the simulation step, which takes as args
+      `(params, rng_key, action, embedding)` and returns a `RecurrentFnOutput`
+      and the new state embedding. The `rng_key` argument is consumed.
+    num_simulations: the number of simulations.
+    invalid_actions: a mask with invalid actions. Invalid actions
+      have ones, valid actions have zeros in the mask. Shape `[B, num_actions]`.
+    max_depth: maximum search tree depth allowed during simulation.
+    loop_fn: Function used to run the simulations. It may be required to pass
+      hk.fori_loop if using this function inside a Haiku module.
+    qtransform: function to obtain completed Q-values for a node.
+    max_num_considered_actions: the maximum number of actions expanded at the
+      root node. A smaller number of actions will be expanded if the number of
+      valid actions is smaller.
+    gumbel_scale: scale for the Gumbel noise. Evalution on perfect-information
+      games can use gumbel_scale=0.0.
+
+  Returns:
+    `PolicyOutput` containing the proposed action, action_weights and the used
+    search tree.
+  """
+  # Masking invalid actions.
+  root = root.replace(
+      prior_logits=_mask_invalid_actions(root.prior_logits, invalid_actions))
+
+  # Generating Gumbel.
+  rng_key, gumbel_rng = jax.random.split(rng_key)
+  gumbel = gumbel_scale * jax.random.gumbel(
+      gumbel_rng, shape=root.prior_logits.shape, dtype=root.prior_logits.dtype)
+
+  # Searching.
+  extra_data = action_selection.GumbelMuZeroExtraData(root_gumbel=gumbel)
+  # search_tree = search.sprites_muzero_search(
+  search_tree = search.search(
+      params=params,
+      rng_key=rng_key,
+      root=root,
+      recurrent_fn=recurrent_fn,
+      root_action_selection_fn=functools.partial(
+          # action_selection.gumbel_muzero_pikl_root_action_selection,
+          action_selection.gumbel_muzero_root_action_selection,
+          num_simulations=num_simulations,
+          max_num_considered_actions=max_num_considered_actions,
+          qtransform=qtransform,
+          # qtransform=qtransforms.qtransform_completed_by_mix_value_interior
+      ),
+      # interior_action_selection_fn=functools.partial(
+      #     action_selection.gumbel_muzero_interior_action_selection,
+      #     qtransform=qtransform,
+      # ),
+      interior_action_selection_fn = functools.partial(
+        action_selection.delta_pikl_puct_action_sampling,
+        # functools.partial(
+        # action_selection.delta_pikl_puct_action_sampling,
+        # qtransform=qtransforms.qtransform_by_parent_and_siblings,
+        qtransform=functools.partial(
+          qtransforms.qtransform_completed_by_mix_value_interior,
+          # rescale_values=False,
+          # use_mixed_value=False,
+          ), 
+        # qtransform=qtransforms.qtransform_completed_by_mix_value_interior
+        ),
+      num_simulations=num_simulations,
+      max_depth=max_depth,
+      invalid_actions=invalid_actions,
+      extra_data=extra_data,
+      loop_fn=loop_fn)
+  summary = search_tree.summary()
+
+  # Acting with the best action from the most visited actions.
+  # The "best" action has the highest `gumbel + logits + q`.
+  # Inside the minibatch, the considered_visit can be different on states with
+  # a smaller number of valid actions.
+  considered_visit = jnp.max(summary.visit_counts, axis=-1, keepdims=True)
+  # The completed_qvalues include imputed values for unvisited actions.
+  completed_qvalues = jax.vmap(qtransform, in_axes=[0, None])(  # pytype: disable=wrong-arg-types  # numpy-scalars  # pylint: disable=line-too-long
+      search_tree, search_tree.ROOT_INDEX)
+  to_argmax = seq_halving.score_considered(
+      considered_visit, gumbel, root.prior_logits, completed_qvalues,
+      summary.visit_counts)
+  action = action_selection.masked_argmax(to_argmax, invalid_actions)
+
+  # Producing action_weights usable to train the policy network.
+  completed_search_logits = _mask_invalid_actions(
+      root.prior_logits + completed_qvalues, invalid_actions)
+  action_weights = jax.nn.softmax(completed_search_logits)
+  return base.PolicyOutput(
+      action=action,
+      action_weights=action_weights,
+      search_tree=search_tree)
+
 def sprites_gumbel_muzero_policy(
     params: base.Params,
     rng_key: chex.PRNGKey,
@@ -203,20 +326,39 @@ def sprites_gumbel_muzero_policy(
   # Searching.
   extra_data = action_selection.GumbelMuZeroExtraData(root_gumbel=gumbel)
   search_tree = search.sprites_muzero_search(
+  # search_tree = search.search(
       params=params,
       rng_key=rng_key,
       root=root,
       recurrent_fn=recurrent_fn,
       root_action_selection_fn=functools.partial(
+          # action_selection.gumbel_muzero_pikl_root_action_selection,
           action_selection.gumbel_muzero_root_action_selection,
           num_simulations=num_simulations,
           max_num_considered_actions=max_num_considered_actions,
           qtransform=qtransform,
+          # qtransform=qtransforms.qtransform_completed_by_mix_value_interior
       ),
-      interior_action_selection_fn=functools.partial(
-          action_selection.gumbel_muzero_interior_action_selection,
-          qtransform=qtransform,
-      ),
+      # interior_action_selection_fn=functools.partial(
+      #     action_selection.gumbel_muzero_interior_action_selection,
+      #     qtransform=qtransform,
+      # ),
+      interior_action_selection_fn = functools.partial(
+        action_selection.delta_pikl_puct_action_sampling,
+        # functools.partial(
+        # action_selection.delta_pikl_puct_action_sampling,
+        # qtransform=qtransforms.qtransform_by_parent_and_siblings,
+        # qtransform=functools.partial(
+        #   qtransforms.qtransform_by_min_max,
+        #   min_value=-1,
+        #   max_value=1)
+        qtransform=functools.partial(
+          qtransforms.qtransform_completed_by_mix_value_interior,
+          # rescale_values=False,
+          # use_mixed_value=False,
+          ), 
+        # qtransform=qtransforms.qtransform_completed_by_mix_value_interior
+        ),
       num_simulations=num_simulations,
       max_depth=max_depth,
       invalid_actions=invalid_actions,
@@ -320,7 +462,8 @@ def sprites_muzero_policy(
 
   # Running the search.
   interior_action_selection_fn = functools.partial(
-      action_selection.muzero_action_selection,
+      # action_selection.muzero_action_selection,
+      action_selection.delta_pikl_puct_action_sampling,
       pb_c_base=pb_c_base,
       pb_c_init=pb_c_init,
       qtransform=qtransform)
@@ -350,24 +493,11 @@ def sprites_muzero_policy(
   # print(jnp.ones_like(summary.visit_counts).shape)
   # qvalues = summary.qvalues
   qvalues = jax.vmap(qtransform, in_axes=[0, None])(search_tree, search_tree.ROOT_INDEX)
-  # print(qvalues.shape)
-  # num_actions_batched = jnp.ones_like(num_visits) * search_tree.num_actions
-  # print(num_actions_batched.shape)
 
-
-  # action_weights = summary.visit_probs
-  # action_logits = _apply_temperature(
-  #     _get_logits_from_probs(action_weights), temperature)
-  # action = jax.random.categorical(rng_key, action_logits)
-
-  # jax.debug.print("Policy weights 1: {p}", p=action_weights[0])
   pb_c =  pb_c_init + jnp.log((num_visits + pb_c_base + 1.) / pb_c_base)
   action_weights = jax.vmap(action_selection.compute_pikl_puct_weights)(qvalues, jax.nn.softmax(root.prior_logits),
                       num_visits, jnp.ones_like(num_visits) * search_tree.num_actions, 
                       jnp.ones_like(num_visits) * pb_c,)
-  # jax.debug.print("prior logits: {p}", p=jax.nn.softmax(root.prior_logits)[0])
-  # jax.debug.print("Policy weights 2: {p}", p=action_weights[0])
-  # jax.debug.print("Policy weights 2 sum: {p}", p=jnp.sum(action_weights[0]))
   
   action_logits = _apply_temperature(
       _get_logits_from_probs(action_weights), temperature)
@@ -392,16 +522,17 @@ def sprites_policy(
     root: base.RootFnOutput,
     recurrent_fn: base.RecurrentFn,
     num_simulations: int,
-    num_samples: int,
+    num_samples: int = 1,
     invalid_actions: Optional[chex.Array] = None,
     max_depth: Optional[int] = None,
     loop_fn: base.LoopFn = jax.lax.fori_loop,
     *,
     qtransform: base.QTransform = qtransforms.qtransform_by_parent_and_siblings,
-    dirichlet_fraction: chex.Numeric = 0.25,
+    dirichlet_fraction: chex.Numeric = 0.0,
     dirichlet_alpha: chex.Numeric = 0.3,
     pb_c_init: chex.Numeric = 1.25,
     pb_c_base: chex.Numeric = 19652,
+    fraction: chex.Numeric = 1.0,
     temperature: chex.Numeric = 1.0) -> base.PolicyOutput[None]:
   """Runs MuZero search and returns the `PolicyOutput`.
 
@@ -456,6 +587,7 @@ def sprites_policy(
       action_selection.delta_pikl_puct_action_sampling_parallel,
       pb_c_base=pb_c_base,
       pb_c_init=pb_c_init,
+      fraction=fraction,
       qtransform=qtransform)
   root_action_selection_fn = functools.partial(
       interior_action_selection_fn,
@@ -480,47 +612,22 @@ def sprites_policy(
   summary = search_tree.summary()
   # action_weights = summary.visit_probs
   num_visits = summary.visit_counts.sum(axis=-1)
-  # print(num_visits.shape)
-  # print(jnp.ones_like(summary.visit_counts).shape)
-  # qvalues = summary.qvalues
-  # print(qvalues.shape)
-  # num_actions_batched = jnp.ones_like(num_visits) * search_tree.num_actions
-  # print(num_actions_batched.shape)
-  # pb_c =  pb_c_init + jnp.log((num_visits + pb_c_base + 1.) / pb_c_base)
-  # action_weights = jax.vmap(action_selection.compute_pikl_puct_weights)(qvalues, jax.nn.softmax(root.prior_logits),
-  #                     num_visits, jnp.ones_like(num_visits) * search_tree.num_actions, 
-  #                     jnp.ones_like(num_visits) * pb_c,)
 
-
-  # action_weights = summary.visit_probs
-  # action_logits = _apply_temperature(
-  #     _get_logits_from_probs(action_weights), temperature)
-  # action = jax.random.categorical(rng_key, action_logits)
-
-  # print(action_weights)
-  # print(search_tree.node_values[search_tree.ROOT_INDEX])
   qvalues = jax.vmap(qtransform, in_axes=[0, None])(search_tree, search_tree.ROOT_INDEX)
-  # print(qvalues.shape)
-  # num_actions_batched = jnp.ones_like(num_visits) * search_tree.num_actions
-  # print(num_actions_batched.shape)
+
   pb_c =  pb_c_init + jnp.log((num_visits + pb_c_base + 1.) / pb_c_base)
-  action_weights = jax.vmap(action_selection.compute_pikl_puct_weights)(qvalues, jax.nn.softmax(root.prior_logits),
-                      num_visits, jnp.ones_like(num_visits) * search_tree.num_actions, 
-                      jnp.ones_like(num_visits) * pb_c,)
-  # jax.debug.print("qvalues: {p}", p=qvalues[0]) 
-  # jax.debug.print("prior logits: {p}", p=root.prior_logits[0])
-  # jax.debug.print("action weights: {p}", p=action_weights[0])
-  # action_weights = summary.visit_probs
+  action_weights = jax.vmap(action_selection.compute_pikl_puct_weights)(qvalues, 
+      jax.nn.softmax(root.prior_logits),
+      num_visits, jnp.ones_like(num_visits) * search_tree.num_actions, 
+      jnp.ones_like(num_visits) * pb_c,)
+
   action_logits = _apply_temperature(
       _get_logits_from_probs(action_weights), temperature)
   action = jax.random.categorical(rng_key, action_logits)
 
   # jax.debug.print("Policy weights 1: {p}", p=action_weights[0])
 
-  
-  # action = jax.random.categorical(rng_key, action_logits)
-  # print(search_tree.num_actions.shape)
-  # action = jax.random.choice(rng_key, search_tree.num_actions, p=action_weights)
+
   return base.PolicyOutput(
       action=action,
       action_weights=action_weights,
@@ -1155,6 +1262,17 @@ def muzero_policy(
   action_weights = summary.visit_probs
   action_logits = _apply_temperature(
       _get_logits_from_probs(action_weights), temperature)
+  # num_visits = summary.visit_counts.sum(axis=-1)
+  # qvalues = jax.vmap(qtransform, in_axes=[0, None])(search_tree, search_tree.ROOT_INDEX)
+
+  # pb_c =  pb_c_init + jnp.log((num_visits + pb_c_base + 1.) / pb_c_base)
+  # action_weights = jax.vmap(action_selection.compute_pikl_puct_weights)(qvalues, jax.nn.softmax(root.prior_logits),
+  #                     num_visits, jnp.ones_like(num_visits) * search_tree.num_actions, 
+  #                     jnp.ones_like(num_visits) * pb_c,)
+  
+  # action_logits = _apply_temperature(
+  #     _get_logits_from_probs(action_weights), temperature)
+
   action = jax.random.categorical(rng_key, action_logits)
   return base.PolicyOutput(
       action=action,

@@ -78,10 +78,71 @@ def qtransform_by_parent_and_siblings(
   max_value = jnp.maximum(node_value, jnp.max(safe_qvalues, axis=-1))
 
   completed_by_min = jnp.where(visit_counts > 0, qvalues, min_value)
+  # normalized = (safe_qvalues - min_value) / (
+  #     jnp.maximum(max_value - min_value, epsilon))
+
   normalized = (completed_by_min - min_value) / (
       jnp.maximum(max_value - min_value, epsilon))
   chex.assert_equal_shape([normalized, qvalues])
   return normalized
+  # return completed_by_min
+  # return safe_qvalues
+
+
+def qtransform_completed_by_mix_value_interior(
+    tree: tree_lib.Tree,
+    node_index: chex.Numeric,
+    *,
+    rescale_values: bool = True,
+    use_mixed_value: bool = True,
+    epsilon: chex.Numeric = 1e-8,
+) -> chex.Array:
+  """Returns completed qvalues.
+
+  The missing Q-values of the unvisited actions are replaced by the
+  mixed value, defined in Appendix D of
+  "Policy improvement by planning with Gumbel":
+  https://openreview.net/forum?id=bERaNdoegnO
+
+  The Q-values are transformed by a linear transformation:
+    `(maxvisit_init + max(visit_counts)) * value_scale * qvalues`.
+
+  Args:
+    tree: _unbatched_ MCTS tree state.
+    node_index: scalar index of the parent node.
+    value_scale: scale for the Q-values.
+    maxvisit_init: offset to the `max(visit_counts)` in the scaling factor.
+    rescale_values: if True, scale the qvalues by `1 / (max_q - min_q)`.
+    use_mixed_value: if True, complete the Q-values with mixed value,
+      otherwise complete the Q-values with the raw value.
+    epsilon: the minimum denominator when using `rescale_values`.
+
+  Returns:
+    Completed Q-values. Shape `[num_actions]`.
+  """
+  chex.assert_shape(node_index, ())
+  qvalues = tree.qvalues(node_index)
+  visit_counts = tree.children_visits[node_index]
+
+  # Computing the mixed value and producing completed_qvalues.
+  raw_value = tree.raw_values[node_index]
+  prior_probs = jax.nn.softmax(
+      tree.children_prior_logits[node_index])
+  if use_mixed_value:
+    value = _compute_mixed_value(
+        raw_value,
+        qvalues=qvalues,
+        visit_counts=visit_counts,
+        prior_probs=prior_probs)
+  else:
+    value = tree.node_values[node_index]
+    # value = raw_value
+  completed_qvalues = _complete_qvalues(
+      qvalues, visit_counts=visit_counts, value=value)
+  # Scaling the Q-values.
+  if rescale_values:
+    completed_qvalues = _rescale_qvalues(completed_qvalues, epsilon)
+  return completed_qvalues
 
 
 def qtransform_completed_by_mix_value(
