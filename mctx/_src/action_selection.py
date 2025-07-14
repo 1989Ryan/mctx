@@ -277,7 +277,7 @@ def delta_pikl_puct_action_sampling(
   Returns:
     action: the action selected from the given node.
   """
-  del rng_key
+  # del rng_key
   visit_counts = tree.children_visits[node_index]
   node_visit = tree.node_visits[node_index]
   # pb_c = pb_c_init + jnp.log((node_visit + pb_c_base + 1.) / pb_c_base)
@@ -294,11 +294,10 @@ def delta_pikl_puct_action_sampling(
   values = qtransform(tree, node_index)
   policy_weights = compute_pikl_puct_weights(values, prior_probs, 
             node_visit, tree.num_actions, pb_c)
-  # node_noise_score = 1e-7 * jax.random.uniform(
-  #     rng_key, (tree.num_actions,))
+  node_noise_score = 1e-7 * jax.random.uniform(
+      rng_key, (tree.num_actions,))
   to_argmax = _prepare_argmax_input(
-      policy_weights, visit_counts) 
-  # + node_noise_score
+      policy_weights, visit_counts) + node_noise_score
   to_return = masked_argmax(to_argmax, tree.root_invalid_actions * (depth == 0)) 
   return to_return
 

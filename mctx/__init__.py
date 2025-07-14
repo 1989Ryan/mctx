@@ -14,6 +14,9 @@
 # ==============================================================================
 """Mctx: Monte Carlo tree search in JAX."""
 
+import sys
+sys.path.append("src/mctx")
+
 from mctx._src.action_selection import gumbel_muzero_interior_action_selection
 from mctx._src.action_selection import gumbel_muzero_root_action_selection
 from mctx._src.action_selection import GumbelMuZeroExtraData
